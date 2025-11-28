@@ -1,0 +1,14 @@
+[
+  "function usernameToAddress(string) view returns (address)",
+  "function addressToUsername(address) view returns (string)",
+  "function registerUsername(string)",
+  "function registerPremiumUsername(string) payable",
+  "function getAddress(string) view returns (address)",
+  "function getUsername(address) view returns (string)",
+  "function isValidUsername(string) pure returns (bool)",
+  "function isUsernameAvailable(string) view returns (bool)",
+  "event UsernameRegistered(address indexed user, string username, bool isPremium)",
+  "event UsernameUpdated(address indexed user, string oldUsername, string newUsername)"
+]
+
+
