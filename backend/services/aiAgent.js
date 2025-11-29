@@ -1,11 +1,12 @@
 import { ethers } from 'ethers'
 import { BASE_RPC, CONTRACTS, TOKENS } from './config.js'
-import { dbGet, dbAll } from './database.js'
+import { dbGet, dbAll, dbRun } from './database.js'
 import { getTokenBalance } from './wallet.js'
 import OpenAI from 'openai'
 import dotenv from 'dotenv'
 import { getUserFriendlyError } from './errorMessages.js'
-import { executePayment, executeRegisterUsername } from './aiActions.js'
+import { executePayment, executeRegisterUsername, executeSchedulePayment, executeViewScheduledPayments, executeCancelScheduledPayment } from './aiActions.js'
+import { getPaymentStatistics, generateTransactionReport, formatStatisticsMessage, formatReportMessage, generateReportInsights } from './analytics.js'
 
 dotenv.config()
 
@@ -21,6 +22,7 @@ class SendCashAI {
     this.initialized = false
     this.openai = null
     this.pendingActions = new Map() // Store pending actions for confirmation
+    this.pendingSwaps = {} // Store pending swaps for confirmation
     
     // Conversation memory - stores last N messages per user
     this.conversationHistory = new Map() // userId -> [{ role, content, timestamp }, ...]
@@ -628,18 +630,61 @@ class SendCashAI {
       const systemPrompt = `You are an intent classifier for SendCash, a crypto payment platform.
 
 Classify the user's message into one of these intents:
-- check_balance: User wants to check their wallet balance
-- send_payment: User wants to send a payment to someone
-- view_history: User wants to see transaction history
-- get_insights: User wants spending insights or analysis
-- register_username: User wants to register a username
-- search_username: User wants to search/lookup a username
-- export_key: User wants to export/show their private key (e.g., "export my key", "show private key", "export key")
-- help: User needs help or wants to know what the bot can do
+
+PAYMENT INTENTS:
+- send_payment: Immediate payment (e.g., "send $10 to @alice", "pay bob 50 USDC")
+- schedule_payment: Scheduled payment for future (look for keywords like):
+  * "schedule", "in X minutes", "in X hours", "in X days"
+  * "tomorrow", "next week", "on [date]", "at [time]"
+  * Examples: "send $10 to @alice in 2 minutes", "schedule $50 to @bob for tomorrow", "pay $20 to @charlie on December 25th"
+
+SCHEDULING MANAGEMENT:
+- view_scheduled_payments: View scheduled payments (e.g., "show scheduled payments", "what payments are scheduled", "list my scheduled payments")
+- cancel_scheduled_payment: Cancel a scheduled payment (e.g., "cancel scheduled payment #1", "cancel payment ID 1", "delete scheduled payment 2")
+
+WALLET INTENTS:
+- check_balance: Check wallet balance (e.g., "what's my balance", "show balance", "how much do I have")
+- view_history: View transaction history (e.g., "show my transactions", "transaction history", "payment history")
+- get_insights: Spending insights/analysis (e.g., "spending insights", "wallet analysis", "how much did I spend")
+- payment_statistics: Payment statistics and analytics (e.g., "payment stats", "show statistics", "transaction stats")
+- transaction_report: Detailed transaction report (e.g., "transaction report", "generate report", "monthly report")
+
+SWAP INTENTS:
+- swap_tokens: Token swap/exchange. Look for keywords: "swap", "convert", "exchange", "trade", "change", "switch"
+  * Examples:
+    - "swap 100 USDC to USDT"
+    - "convert 50 USDT to WBTC"
+    - "exchange 200 USDC for ETH"
+    - "I want to swap 10 USDC to USDT"
+    - "can you convert 25 USDT to WBTC?"
+    - "trade 100 USDC for USDT"
+    - "change 50 USDC to USDT"
+    - "switch my USDC to USDT"
+    - "swap tokens" (general swap request)
+    - "convert USDC to USDT" (amount may be in context)
+    - "I need to exchange 75 USDT for WBTC"
+    - "swap 1000 USDC into USDT"
+    - "convert my USDC to ETH"
+    - "exchange tokens"
+
+USERNAME INTENTS:
+- register_username: Register a username (e.g., "register @alice", "create account with username bob")
+- search_username: Search/lookup username (e.g., "search @alice", "who is @bob", "find @charlie")
+
+SECURITY:
+- export_key: Export private key (e.g., "export my key", "show private key", "export key")
+
+HELP:
+- help: Need help or want to know what bot can do (e.g., "help", "what can you do", "how does this work")
 - general_chat: General conversation, greetings, questions not related to SendCash
 
+IMPORTANT: 
+- If message contains scheduling keywords (schedule, in X minutes, tomorrow, etc.) AND payment details, classify as schedule_payment
+- If message is just about viewing/cancelling scheduled payments, use view_scheduled_payments or cancel_scheduled_payment
+- If message is immediate payment without scheduling, use send_payment
+
 Return ONLY a JSON object with "intent" and "confidence" (0-1).
-Example: {"intent": "check_balance", "confidence": 0.95}`
+Example: {"intent": "schedule_payment", "confidence": 0.95}`
 
       const messages = [
         { role: 'system', content: systemPrompt },
@@ -708,14 +753,53 @@ Extract payment details from the user's message. Return a JSON object with:
 - hasPaymentIntent: boolean
 - amount: number (if found)
 - recipient: string (username without @)
-- token: string (USDC, USDT, WBTC - default to USDC if not specified)
+- token: string (USDC, USDT, WBTC - ONLY return a token if explicitly mentioned in the message, otherwise return null)
 - memo: string (optional note/purpose for the payment)
+- scheduledDate: string (ISO 8601 date string if payment is scheduled for future, null for immediate payments)
+- isScheduled: boolean (true if payment should be scheduled, false for immediate)
 
-If no payment intent is found, return {"hasPaymentIntent": false}.
-Example: {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token": "USDC", "memo": "for lunch"}`
+SCHEDULING DETECTION:
+- If message contains scheduling keywords like "schedule", "in X minutes", "in X hours", "tomorrow", "next week", "on [date]", "at [time]", etc., set isScheduled: true
+- For relative times like "in 2 minutes", "in 5 minutes", "in 1 hour", "in 2 hours", "in 3 days":
+  * Calculate the exact future time from NOW
+  * Convert to ISO 8601 format in UTC
+  * Example: If now is 2024-11-29T04:10:00Z and user says "in 2 minutes", return "2024-11-29T04:12:00Z"
+- For absolute dates like "tomorrow", "December 25th", "at 3pm tomorrow":
+  * Parse the date/time and convert to ISO 8601 format in UTC
+  * Example: "tomorrow at 3pm" → calculate tomorrow's date at 15:00 UTC
+
+IMPORTANT RULES:
+1. Always use UTC timezone (append 'Z' to ISO strings)
+2. For relative times, calculate from current time (NOW)
+3. Ensure scheduledDate is always in the future
+4. If no scheduling intent found, set isScheduled: false and scheduledDate: null
+
+EXAMPLES:
+Immediate payment with token: "send $10 USDC to @alice"
+→ {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token": "USDC", "memo": null, "isScheduled": false, "scheduledDate": null}
+
+Immediate payment without token: "send $10 to @alice"
+→ {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token": null, "memo": null, "isScheduled": false, "scheduledDate": null}
+
+Scheduled with token: "send $10 USDT to @alice in 2 minutes"
+→ {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token": "USDT", "memo": null, "isScheduled": true, "scheduledDate": "2024-11-29T04:12:00Z"}
+
+Scheduled without token: "send $10 to @alice in 2 minutes"
+→ {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token": null, "memo": null, "isScheduled": true, "scheduledDate": "2024-11-29T04:12:00Z"}
+
+Scheduled - absolute: "schedule $50 USDC to @bob for tomorrow at 3pm"
+→ {"hasPaymentIntent": true, "amount": 50, "recipient": "bob", "token": "USDC", "memo": null, "isScheduled": true, "scheduledDate": "2024-11-30T15:00:00Z"}
+
+If no payment intent found, return {"hasPaymentIntent": false}.`
+
+      // Add current time context for better relative time calculations
+      const now = new Date()
+      const currentTimeContext = `\n\nCURRENT TIME CONTEXT (for relative time calculations):
+Current UTC time: ${now.toISOString()}
+Use this as the reference point for calculating "in X minutes/hours" expressions.`
 
       const messages = [
-        { role: 'system', content: systemPrompt },
+        { role: 'system', content: systemPrompt + currentTimeContext },
         ...recentHistory.map(msg => ({ role: msg.role, content: msg.content })),
         { role: 'user', content: message }
       ]
@@ -771,11 +855,11 @@ Example: {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token":
       }
     }
     
-    // Extract recipient
+    // Extract recipient (allow underscores and hyphens in usernames)
     const recipientPatterns = [
-      /@(\w+)/,
-      /(?:to|for)\s+@?(\w+)/i,
-      /(?:send|pay|transfer).*?@?(\w+)/
+      /@([a-zA-Z0-9_]+)/,  // Match @username with underscores
+      /(?:to|for)\s+@?([a-zA-Z0-9_]+)/i,
+      /(?:send|pay|transfer).*?@?([a-zA-Z0-9_]+)/
     ]
     
     let recipient = null
@@ -850,6 +934,15 @@ Example: {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token":
       case 'get_insights':
         return await this.executeGetInsights(context.walletAddress)
       
+      case 'payment_statistics':
+        return await this.executePaymentStatistics(message, context.walletAddress)
+      
+      case 'transaction_report':
+        return await this.executeTransactionReport(message, context.walletAddress)
+      
+      case 'swap_tokens':
+        return await this.executeSwap(message, userId, context, bot)
+      
       case 'register_username':
         return await this.executeRegisterUsername(message, userId, context, bot)
       
@@ -860,6 +953,15 @@ Example: {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token":
       case 'export_private_key':
       case 'show_private_key':
         return await this.executeExportPrivateKey(userId, bot)
+      
+      case 'schedule_payment':
+        return await this.executeSchedulePayment(message, userId, context.walletAddress, context.username, bot)
+      
+      case 'view_scheduled_payments':
+        return await this.executeViewScheduledPayments(userId, bot)
+      
+      case 'cancel_scheduled_payment':
+        return await this.executeCancelScheduledPayment(message, userId, bot)
       
       case 'help':
         return await this.executeHelp()
@@ -964,8 +1066,63 @@ Example: {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token":
         console.log(`[AI Agent] Using fast manual extraction (no AI call)`)
         const amount = manualExtract.amount
         const recipient = manualExtract.recipient
-        const tokenSymbol = manualExtract.tokenSymbol || 'USDC'
         const memo = manualExtract.memo
+        
+        // ✅ Check if token was explicitly specified in the message
+        const messageLower = message.toLowerCase()
+        const hasTokenSpecified = 
+          messageLower.includes('usdc') || 
+          messageLower.includes('usdt') || 
+          messageLower.includes('wbtc') ||
+          messageLower.includes('bitcoin') ||
+          messageLower.includes('tether') ||
+          contextToken // If token was mentioned in conversation history
+        
+        // If no token was specified, ask user which asset to use
+        if (!hasTokenSpecified && !contextToken) {
+          return {
+            success: false,
+            message: `💰 **Which asset would you like to send?**\n\n` +
+              `You want to send $${amount} to @${recipient}, but I need to know which token:\n\n` +
+              `• **USDC** (USD Coin)\n` +
+              `• **USDT** (Tether)\n` +
+              `• **WBTC** (Wrapped Bitcoin)\n\n` +
+              `Please specify, for example:\n` +
+              `• "Send $${amount} USDC to @${recipient}"\n` +
+              `• "Pay @${recipient} $${amount} USDT"\n` +
+              `• "Send $${amount} WBTC to @${recipient}"`
+          }
+        }
+        
+        const tokenSymbol = manualExtract.tokenSymbol || contextToken || 'USDC'
+        
+        // ✅ VALIDATE USERNAME EXISTS BEFORE PROCEEDING
+        console.log(`[AI Agent] Validating recipient username: @${recipient}`)
+        const usernameValidation = await this.validateUsernameExists(recipient)
+        
+        if (!usernameValidation.exists) {
+          console.log(`[AI Agent] ❌ Username @${recipient} not found`)
+          let errorMessage = `❌ **Username Not Found**\n\n` +
+            `The username @${recipient} is not registered in our system.\n\n`
+          
+          // Provide suggestions if available
+          if (usernameValidation.suggestions && usernameValidation.suggestions.length > 0) {
+            errorMessage += `💡 **Did you mean?**\n`
+            usernameValidation.suggestions.slice(0, 5).forEach(suggestion => {
+              errorMessage += `• @${suggestion}\n`
+            })
+            errorMessage += `\n`
+          }
+          
+          errorMessage += `Please check the username and try again, or ask the recipient to register first.`
+          
+          return {
+            success: false,
+            message: errorMessage
+          }
+        }
+        
+        console.log(`[AI Agent] ✅ Username @${recipient} validated (address: ${usernameValidation.address})`)
         
         // CRITICAL: Store pending action BEFORE returning
         const actionKey = `payment_${userId}_${Date.now()}`
@@ -1038,7 +1195,8 @@ Example: {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token":
           paymentIntent = { hasPaymentIntent: true }
         }
         paymentIntent.amount = parseFloat(contextAmount)
-        paymentIntent.token = contextToken || 'USDC'
+        // Don't set default token here - let the check below handle it
+        paymentIntent.token = contextToken || null
       } else if (manualExtract && manualExtract.amount && manualExtract.recipient) {
         // Use manual extraction with context
         const amount = manualExtract.amount
@@ -1109,7 +1267,7 @@ Example: {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token":
       
       const amount = paymentIntent.amount?.toString() || contextAmount
       const recipient = paymentIntent.recipient
-      const tokenSymbol = (paymentIntent.token || contextToken || 'USDC').toUpperCase()
+      const token = paymentIntent.token || contextToken
       const memo = paymentIntent.memo || null
       
       if (!amount || !recipient) {
@@ -1118,6 +1276,66 @@ Example: {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token":
           success: false,
           message: friendlyError.message || friendlyError
         }
+      }
+
+      // ✅ Check if token was explicitly specified in the message
+      // If not, ask user which asset they want to use
+      const messageLower = message.toLowerCase()
+      const hasTokenSpecified = 
+        token && token.toUpperCase() !== 'USDC' || // If token is explicitly set to something other than default
+        messageLower.includes('usdc') || 
+        messageLower.includes('usdt') || 
+        messageLower.includes('wbtc') ||
+        messageLower.includes('bitcoin') ||
+        messageLower.includes('tether') ||
+        contextToken // If token was mentioned in conversation history
+      
+      // If token is not specified (null/undefined) or is default USDC without explicit mention, ask for clarification
+      if (!token || (token.toUpperCase() === 'USDC' && !messageLower.includes('usdc') && !contextToken)) {
+        return {
+          success: false,
+          message: `💰 **Which asset would you like to send?**\n\n` +
+            `You want to send $${amount} to @${recipient}, but I need to know which token:\n\n` +
+            `• **USDC** (USD Coin)\n` +
+            `• **USDT** (Tether)\n` +
+            `• **WBTC** (Wrapped Bitcoin)\n\n` +
+            `Please specify, for example:\n` +
+            `• "Send $${amount} USDC to @${recipient}"\n` +
+            `• "Pay @${recipient} $${amount} USDT"\n` +
+            `• "Send $${amount} WBTC to @${recipient}"`
+        }
+      }
+
+      const tokenSymbol = token.toUpperCase()
+      
+      // ✅ VALIDATE USERNAME EXISTS BEFORE PROCEEDING (AI extraction path)
+      if (recipient) {
+        console.log(`[AI Agent] Validating recipient username (AI path): @${recipient}`)
+        const usernameValidation = await this.validateUsernameExists(recipient)
+        
+        if (!usernameValidation.exists) {
+          console.log(`[AI Agent] ❌ Username @${recipient} not found (AI path)`)
+          let errorMessage = `❌ **Username Not Found**\n\n` +
+            `The username @${recipient} is not registered in our system.\n\n`
+          
+          // Provide suggestions if available
+          if (usernameValidation.suggestions && usernameValidation.suggestions.length > 0) {
+            errorMessage += `💡 **Did you mean?**\n`
+            usernameValidation.suggestions.slice(0, 5).forEach(suggestion => {
+              errorMessage += `• @${suggestion}\n`
+            })
+            errorMessage += `\n`
+          }
+          
+          errorMessage += `Please check the username and try again, or ask the recipient to register first.`
+          
+          return {
+            success: false,
+            message: errorMessage
+          }
+        }
+        
+        console.log(`[AI Agent] ✅ Username @${recipient} validated (AI path, address: ${usernameValidation.address})`)
       }
       
       // Store pending action
@@ -1246,7 +1464,8 @@ Example: {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token":
       return {
         success: true,
         message,
-        data: { transactions }
+        data: { transactions },
+        hasCloseButton: true // Add close button for list views
       }
     } catch (error) {
       console.error('[AI Agent] Error viewing history:', error)
@@ -1271,31 +1490,75 @@ Example: {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token":
     }
     
     try {
-      const analysis = await this.analyzeWalletActivity(walletAddress)
+      // Use enhanced analytics for better insights
+      const stats = await getPaymentStatistics(walletAddress, { timeRange: 'all' })
       
       let message = `📊 **Your Wallet Insights:**\n\n`
       message += `💸 **Spending Summary:**\n`
-      message += `• Total Sent: $${analysis.paymentStats.totalSent.toFixed(2)}\n`
-      message += `• Total Received: $${analysis.paymentStats.totalReceived.toFixed(2)}\n`
-      message += `• Transactions: ${analysis.paymentStats.transactionCount}\n\n`
+      message += `• Total Sent: $${stats.sent.totalAmount.toFixed(2)}\n`
+      message += `• Total Received: $${stats.received.totalAmount.toFixed(2)}\n`
+      message += `• Net Flow: $${stats.netFlow >= 0 ? '+' : ''}${stats.netFlow.toFixed(2)}\n`
+      message += `• Total Transactions: ${stats.totalTransactions}\n`
+      message += `• Total Fees: $${stats.sent.totalFees.toFixed(2)}\n\n`
       
-      if (analysis.paymentStats.topRecipients.length > 0) {
+      // Sent breakdown
+      if (stats.sent.count > 0) {
+        message += `📤 **Sent Breakdown:**\n`
+        message += `• Count: ${stats.sent.count}\n`
+        message += `• Average: $${stats.sent.averageAmount.toFixed(2)}\n`
+        message += `• Largest: $${stats.sent.largestAmount.toFixed(2)}\n\n`
+      }
+      
+      // Received breakdown
+      if (stats.received.count > 0) {
+        message += `📥 **Received Breakdown:**\n`
+        message += `• Count: ${stats.received.count}\n`
+        message += `• Average: $${stats.received.averageAmount.toFixed(2)}\n`
+        message += `• Largest: $${stats.received.largestAmount.toFixed(2)}\n\n`
+      }
+      
+      // Top recipients
+      if (stats.topRecipients.length > 0) {
         message += `👥 **Top Recipients:**\n`
-        analysis.paymentStats.topRecipients.slice(0, 3).forEach((recipient, idx) => {
-          message += `${idx + 1}. @${recipient.username}: $${recipient.amount.toFixed(2)}\n`
+        stats.topRecipients.slice(0, 5).forEach((recipient, idx) => {
+          message += `${idx + 1}. @${recipient.username}: $${recipient.total.toFixed(2)} (${recipient.count} tx)\n`
         })
         message += `\n`
       }
       
-      message += `💡 **Insights:**\n`
-      analysis.insights.forEach((insight, idx) => {
-        message += `${idx + 1}. ${insight}\n`
-      })
+      // Top senders
+      if (stats.topSenders.length > 0) {
+        message += `📥 **Top Senders:**\n`
+        stats.topSenders.slice(0, 5).forEach((sender, idx) => {
+          message += `${idx + 1}. @${sender.username}: $${sender.total.toFixed(2)} (${sender.count} tx)\n`
+        })
+        message += `\n`
+      }
+      
+      // Token breakdown
+      const tokenEntries = Object.entries(stats.byToken)
+      if (tokenEntries.length > 0) {
+        message += `🪙 **By Token:**\n`
+        tokenEntries.forEach(([token, data]) => {
+          message += `• ${token}: Sent $${data.sent.amount.toFixed(2)}, Received $${data.received.amount.toFixed(2)}\n`
+        })
+        message += `\n`
+      }
+      
+      // Enhanced insights
+      const insights = generateReportInsights(stats)
+      if (insights.length > 0) {
+        message += `💡 **Insights:**\n`
+        insights.forEach((insight, idx) => {
+          message += `${idx + 1}. ${insight}\n`
+        })
+      }
       
       return {
         success: true,
         message,
-        data: analysis
+        data: { stats },
+        hasCloseButton: true // Add close button for list views
       }
     } catch (error) {
       console.error('[AI Agent] Error getting insights:', error)
@@ -1305,6 +1568,360 @@ Example: {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token":
         message: friendlyError.message || friendlyError
       }
     }
+  }
+
+  /**
+   * Execute: Payment Statistics
+   */
+  async executePaymentStatistics(message, walletAddress) {
+    if (!walletAddress) {
+      const friendlyError = getUserFriendlyError('Wallet not found', 'general')
+      return {
+        success: false,
+        message: friendlyError.message || friendlyError
+      }
+    }
+
+    try {
+      // Extract time range from message
+      let timeRange = '30d' // Default to 30 days
+      const messageLower = message.toLowerCase()
+      
+      if (messageLower.includes('all time') || messageLower.includes('all-time')) {
+        timeRange = 'all'
+      } else if (messageLower.includes('7 days') || messageLower.includes('week')) {
+        timeRange = '7d'
+      } else if (messageLower.includes('30 days') || messageLower.includes('month')) {
+        timeRange = '30d'
+      } else if (messageLower.includes('90 days') || messageLower.includes('3 months') || messageLower.includes('quarter')) {
+        timeRange = '90d'
+      } else if (messageLower.includes('year') || messageLower.includes('12 months')) {
+        timeRange = '1y'
+      }
+
+      // Extract token if specified
+      let tokenSymbol = null
+      for (const token of Object.keys(TOKENS)) {
+        if (messageLower.includes(token.toLowerCase())) {
+          tokenSymbol = token
+          break
+        }
+      }
+
+      const stats = await getPaymentStatistics(walletAddress, { timeRange, tokenSymbol })
+      const formattedMessage = formatStatisticsMessage(stats)
+
+      return {
+        success: true,
+        message: formattedMessage,
+        data: stats,
+        hasCloseButton: true
+      }
+    } catch (error) {
+      console.error('[AI Agent] Error getting payment statistics:', error)
+      const friendlyError = getUserFriendlyError(error, 'general')
+      return {
+        success: false,
+        message: friendlyError.message || friendlyError
+      }
+    }
+  }
+
+  /**
+   * Execute: Transaction Report
+   */
+  async executeTransactionReport(message, walletAddress) {
+    if (!walletAddress) {
+      const friendlyError = getUserFriendlyError('Wallet not found', 'general')
+      return {
+        success: false,
+        message: friendlyError.message || friendlyError
+      }
+    }
+
+    try {
+      // Extract time range and format from message
+      let timeRange = '30d'
+      let format = 'summary'
+      const messageLower = message.toLowerCase()
+      
+      if (messageLower.includes('all time') || messageLower.includes('all-time')) {
+        timeRange = 'all'
+      } else if (messageLower.includes('7 days') || messageLower.includes('week')) {
+        timeRange = '7d'
+      } else if (messageLower.includes('30 days') || messageLower.includes('month')) {
+        timeRange = '30d'
+      } else if (messageLower.includes('90 days') || messageLower.includes('3 months') || messageLower.includes('quarter')) {
+        timeRange = '90d'
+      } else if (messageLower.includes('year') || messageLower.includes('12 months')) {
+        timeRange = '1y'
+      }
+
+      if (messageLower.includes('detailed') || messageLower.includes('full')) {
+        format = messageLower.includes('full') ? 'full' : 'detailed'
+      }
+
+      const report = await generateTransactionReport(walletAddress, { timeRange, format })
+      const formattedMessage = formatReportMessage(report)
+
+      return {
+        success: true,
+        message: formattedMessage,
+        data: report,
+        hasCloseButton: true
+      }
+    } catch (error) {
+      console.error('[AI Agent] Error generating transaction report:', error)
+      const friendlyError = getUserFriendlyError(error, 'general')
+      return {
+        success: false,
+        message: friendlyError.message || friendlyError
+      }
+    }
+  }
+
+  /**
+   * Execute: Swap Tokens
+   */
+  async executeSwap(message, userId, context, bot) {
+    if (!bot) {
+      return {
+        success: false,
+        message: "I need the bot instance to execute swaps. Please try again."
+      }
+    }
+
+    try {
+      // Extract swap details from message
+      const swapDetails = await this.extractSwapIntent(message)
+      
+      if (!swapDetails || !swapDetails.fromToken || !swapDetails.toToken || !swapDetails.amount) {
+        return {
+          success: false,
+          message: "I couldn't understand your swap request. Please specify:\n" +
+            "• From token (e.g., USDC, USDT)\n" +
+            "• To token (e.g., USDT, WBTC)\n" +
+            "• Amount (e.g., 100)\n\n" +
+            "Example: \"swap 100 USDC to USDT\""
+        }
+      }
+
+      const { fromToken, toToken, amount, slippageBps = 100 } = swapDetails
+
+      // Get user info
+      const user = await dbGet('SELECT * FROM telegram_users WHERE telegram_id = ?', [userId])
+      if (!user || !user.username) {
+        return {
+          success: false,
+          message: "❌ You don't have a registered wallet yet. Please register a username first."
+        }
+      }
+
+      // Check if swap is already pending for confirmation
+      const pendingSwapKey = `${userId}_swap`
+      if (this.pendingSwaps && this.pendingSwaps[pendingSwapKey]) {
+        // User is confirming a swap
+        if (message.toLowerCase().includes('yes') || message.toLowerCase().includes('confirm')) {
+          const pendingSwap = this.pendingSwaps[pendingSwapKey]
+          delete this.pendingSwaps[pendingSwapKey]
+
+          // Execute the swap
+          const { executeSwap } = await import('./swapService.js')
+          const result = await executeSwap(
+            userId,
+            user.username,
+            pendingSwap.fromToken,
+            pendingSwap.toToken,
+            pendingSwap.amount,
+            pendingSwap.slippageBps,
+            bot
+          )
+
+          if (result.success) {
+            return {
+              success: true,
+              message: `✅ Swap executed successfully!\n\n` +
+                `💱 ${pendingSwap.amount} ${pendingSwap.fromToken} → ${result.toAmount} ${pendingSwap.toToken}\n` +
+                `📊 Min received: ${result.minAmountOut} ${pendingSwap.toToken}\n` +
+                `🔗 [View Transaction](${result.blockExplorerUrl})\n\n` +
+                `⏳ Transaction is pending. Check your balance in a few moments.`
+            }
+          } else {
+            return {
+              success: false,
+              message: result.message || "❌ Swap failed. Please try again."
+            }
+          }
+        } else {
+          // User cancelled
+          delete this.pendingSwaps[pendingSwapKey]
+          return {
+            success: true,
+            message: "❌ Swap cancelled."
+          }
+        }
+      }
+
+      // Get quote first
+      const { getSwapQuote } = await import('./swapService.js')
+      const quote = await getSwapQuote(
+        fromToken,
+        toToken,
+        amount,
+        user.wallet_address
+      )
+
+      if (quote.status !== 'success') {
+        return {
+          success: false,
+          message: `❌ ${quote.message || 'Failed to get swap quote. Please try again.'}`
+        }
+      }
+
+      // Store pending swap for confirmation
+      if (!this.pendingSwaps) {
+        this.pendingSwaps = {}
+      }
+      this.pendingSwaps[pendingSwapKey] = {
+        fromToken,
+        toToken,
+        amount,
+        slippageBps,
+        quote
+      }
+
+      // Ask for confirmation
+      return {
+        success: true,
+        message: `💱 **Swap Quote**\n\n` +
+          `**From:** ${amount} ${fromToken}\n` +
+          `**To:** ~${quote.toAmount} ${toToken}\n` +
+          `**Slippage:** ${slippageBps / 100}%\n` +
+          `**Pool:** ${quote.poolAddress ? 'Found' : 'N/A'}\n\n` +
+          `⚠️ **Please confirm this swap**\n` +
+          `Reply "yes" to confirm or "no" to cancel.`
+      }
+    } catch (error) {
+      console.error('[AI Agent] Error executing swap:', error)
+      const friendlyError = getUserFriendlyError(error, 'general')
+      return {
+        success: false,
+        message: friendlyError.message || friendlyError
+      }
+    }
+  }
+
+  /**
+   * Extract swap intent from message
+   */
+  async extractSwapIntent(message) {
+    try {
+      // Manual extraction for common patterns
+      const manualResult = this.manualExtractSwap(message)
+      if (manualResult) {
+        return manualResult
+      }
+
+      // Use AI for complex extraction
+      const systemPrompt = `Extract swap details from the user's message. Return JSON with:
+{
+  "fromToken": "USDC" (token symbol to swap FROM),
+  "toToken": "USDT" (token symbol to swap TO),
+  "amount": "100" (amount as string),
+  "slippageBps": 100 (slippage in basis points, default 100 = 1%)
+}
+
+Common patterns to recognize:
+- "swap [amount] [fromToken] to [toToken]"
+- "convert [amount] [fromToken] to [toToken]"
+- "exchange [amount] [fromToken] for [toToken]"
+- "trade [amount] [fromToken] for [toToken]"
+- "change [amount] [fromToken] to [toToken]"
+- "switch [amount] [fromToken] to [toToken]"
+- "[fromToken] to [toToken]" (amount may be in previous context)
+
+Examples:
+- "swap 100 USDC to USDT" → {"fromToken": "USDC", "toToken": "USDT", "amount": "100", "slippageBps": 100}
+- "convert 50 USDT to WBTC" → {"fromToken": "USDT", "toToken": "WBTC", "amount": "50", "slippageBps": 100}
+- "exchange 200 USDC for ETH" → {"fromToken": "USDC", "toToken": "ETH", "amount": "200", "slippageBps": 100}
+- "I want to swap 10 USDC to USDT" → {"fromToken": "USDC", "toToken": "USDT", "amount": "10", "slippageBps": 100}
+- "can you convert 25 USDT to WBTC?" → {"fromToken": "USDT", "toToken": "WBTC", "amount": "25", "slippageBps": 100}
+- "trade 100 USDC for USDT" → {"fromToken": "USDC", "toToken": "USDT", "amount": "100", "slippageBps": 100}
+- "change 50 USDC to USDT" → {"fromToken": "USDC", "toToken": "USDT", "amount": "50", "slippageBps": 100}
+- "swap my USDC to USDT" → {"fromToken": "USDC", "toToken": "USDT", "amount": null, "slippageBps": 100} (amount needs context)
+- "convert USDC to ETH" → {"fromToken": "USDC", "toToken": "ETH", "amount": null, "slippageBps": 100} (amount needs context)
+
+Supported tokens: USDC, USDT, WBTC, ETH, WETH
+
+Return ONLY valid JSON, no other text.`
+
+      const response = await this.queueOpenAIRequest([
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: message }
+      ])
+
+      const jsonMatch = response.match(/\{[\s\S]*\}/)
+      if (jsonMatch) {
+        return JSON.parse(jsonMatch[0])
+      }
+    } catch (error) {
+      console.error('[AI Agent] Error extracting swap intent:', error)
+    }
+    return null
+  }
+
+  /**
+   * Manual extraction for common swap patterns
+   */
+  manualExtractSwap(message) {
+    const lower = message.toLowerCase()
+    
+    // Multiple patterns to catch various ways users express swaps
+    const patterns = [
+      // "swap 100 USDC to USDT"
+      /(?:swap|convert|exchange|trade|change|switch)\s+(\d+(?:\.\d+)?)\s+(\w+)\s+(?:to|for|into)\s+(\w+)/i,
+      // "swap USDC to USDT" (no amount, will need context)
+      /(?:swap|convert|exchange|trade|change|switch)\s+(\w+)\s+(?:to|for|into)\s+(\w+)/i,
+      // "100 USDC to USDT"
+      /(\d+(?:\.\d+)?)\s+(\w+)\s+(?:to|for|into)\s+(\w+)/i,
+      // "USDC to USDT" (no amount)
+      /(\w+)\s+(?:to|for|into)\s+(\w+)/i
+    ]
+    
+    for (const pattern of patterns) {
+      const match = message.match(pattern)
+      if (match) {
+        // Check if first capture is a number (amount) or token
+        const firstGroup = match[1]
+        const isAmount = /^\d+(?:\.\d+)?$/.test(firstGroup)
+        
+        if (isAmount && match.length >= 4) {
+          // Pattern: "swap 100 USDC to USDT"
+          const [, amount, fromToken, toToken] = match
+          return {
+            fromToken: fromToken.toUpperCase(),
+            toToken: toToken.toUpperCase(),
+            amount: amount,
+            slippageBps: 100
+          }
+        } else if (!isAmount && match.length >= 3) {
+          // Pattern: "swap USDC to USDT" (no amount specified)
+          const [, fromToken, toToken] = match
+          // Check if this looks like tokens (not common words)
+          const tokenSymbols = ['USDC', 'USDT', 'WBTC', 'ETH', 'WETH']
+          if (tokenSymbols.includes(fromToken.toUpperCase()) && tokenSymbols.includes(toToken.toUpperCase())) {
+            return {
+              fromToken: fromToken.toUpperCase(),
+              toToken: toToken.toUpperCase(),
+              amount: null, // Will need to ask user or get from context
+              slippageBps: 100
+            }
+          }
+        }
+      }
+    }
+    
+    return null
   }
 
   /**
@@ -1407,6 +2024,351 @@ Example: {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token":
   }
 
   /**
+   * Execute: Schedule Payment
+   */
+  async executeSchedulePayment(message, userId, walletAddress, username, bot) {
+    if (!bot) {
+      return {
+        success: false,
+        message: "I need the bot instance to schedule payments. Please try again."
+      }
+    }
+
+    try {
+      // Extract payment intent with scheduling info
+      const paymentIntent = await this.extractPaymentIntent(message, userId)
+      
+      if (!paymentIntent || !paymentIntent.hasPaymentIntent) {
+        return {
+          success: false,
+          message: "I couldn't understand the payment details. Please specify:\n" +
+            "• Recipient (e.g., @alice)\n" +
+            "• Amount (e.g., $10)\n" +
+            "• Date/time (e.g., tomorrow at 3pm, December 25th)"
+        }
+      }
+
+      const { amount, recipient, token, memo = null, scheduledDate, isScheduled } = paymentIntent
+
+      if (!amount || !recipient) {
+        return {
+          success: false,
+          message: "I need both the recipient and amount to schedule a payment. Please try again."
+        }
+      }
+
+      // ✅ Check if token was explicitly specified
+      // If token is null, undefined, or empty, ask user which asset they want to use
+      const messageLower = message.toLowerCase()
+      const hasTokenSpecified = 
+        token && token !== 'USDC' || // If token is explicitly set to something other than default
+        messageLower.includes('usdc') || 
+        messageLower.includes('usdt') || 
+        messageLower.includes('wbtc') ||
+        messageLower.includes('bitcoin') ||
+        messageLower.includes('tether')
+      
+      // If token is not specified (null/undefined) or is default USDC without explicit mention, ask for clarification
+      if (!token || (token === 'USDC' && !messageLower.includes('usdc'))) {
+        return {
+          success: false,
+          message: `💰 **Which asset would you like to send?**\n\n` +
+            `You want to send $${amount} to @${recipient}, but I need to know which token:\n\n` +
+            `• **USDC** (USD Coin)\n` +
+            `• **USDT** (Tether)\n` +
+            `• **WBTC** (Wrapped Bitcoin)\n\n` +
+            `Please specify, for example:\n` +
+            `• "Send $${amount} USDC to @${recipient} in 2 minutes"\n` +
+            `• "Schedule $${amount} USDT to @${recipient} tomorrow"\n` +
+            `• "Send $${amount} WBTC to @${recipient} next week"`
+        }
+      }
+
+      if (!isScheduled || !scheduledDate) {
+        return {
+          success: false,
+          message: "I couldn't find a scheduled date/time. Please specify when to send the payment, e.g.,\n" +
+            "• \"tomorrow at 3pm\"\n" +
+            "• \"on December 25th\"\n" +
+            "• \"next week\""
+        }
+      }
+
+      // Parse scheduled date - try manual parsing first for relative times
+      let scheduledDateTime
+      try {
+        // First, try to manually parse relative time expressions from the original message
+        const relativeTimeMatch = message.match(/in\s+(\d+)\s+(minute|minutes|hour|hours|day|days|second|seconds)/i)
+        if (relativeTimeMatch) {
+          const value = parseInt(relativeTimeMatch[1])
+          const unit = relativeTimeMatch[2].toLowerCase()
+          
+          const now = new Date()
+          let futureDate = new Date(now)
+          
+          if (unit.includes('second')) {
+            futureDate.setSeconds(now.getSeconds() + value)
+          } else if (unit.includes('minute')) {
+            futureDate.setMinutes(now.getMinutes() + value)
+          } else if (unit.includes('hour')) {
+            futureDate.setHours(now.getHours() + value)
+          } else if (unit.includes('day')) {
+            futureDate.setDate(now.getDate() + value)
+          }
+          
+          scheduledDateTime = futureDate
+          console.log(`[AI Agent] Manually parsed relative time:`, {
+            original: message,
+            extracted: `${value} ${unit}`,
+            calculated: futureDate.toISOString(),
+            now: now.toISOString(),
+            timeDiffSeconds: Math.floor((futureDate.getTime() - now.getTime()) / 1000)
+          })
+        } else {
+          // Fall back to AI-extracted date
+          scheduledDateTime = new Date(scheduledDate)
+          if (isNaN(scheduledDateTime.getTime())) {
+            throw new Error('Invalid date')
+          }
+          
+          console.log(`[AI Agent] Parsed scheduled date from AI:`, {
+            original: scheduledDate,
+            parsed: scheduledDateTime.toISOString(),
+            now: new Date().toISOString(),
+            timeDiff: scheduledDateTime.getTime() - new Date().getTime(),
+            timeDiffSeconds: Math.floor((scheduledDateTime.getTime() - new Date().getTime()) / 1000)
+          })
+        }
+      } catch (error) {
+        console.error(`[AI Agent] Error parsing scheduled date:`, { scheduledDate, message, error: error.message })
+        return {
+          success: false,
+          message: "I couldn't parse the scheduled date. Please use a clear date/time format like 'in 2 minutes' or 'tomorrow at 3pm'."
+        }
+      }
+
+      // Ensure token is uppercase
+      const tokenSymbol = (token || 'USDC').toUpperCase()
+      return await executeSchedulePayment(userId, recipient, amount.toString(), tokenSymbol, scheduledDateTime, bot, memo)
+    } catch (error) {
+      console.error('[AI Agent] Error scheduling payment:', error)
+      const friendlyError = getUserFriendlyError(error, 'payment')
+      return {
+        success: false,
+        message: friendlyError.message || friendlyError
+      }
+    }
+  }
+
+  /**
+   * Execute: View Scheduled Payments
+   */
+  async executeViewScheduledPayments(userId, bot) {
+    if (!bot) {
+      return {
+        success: false,
+        message: "I need the bot instance to view scheduled payments. Please try again."
+      }
+    }
+
+    try {
+      return await executeViewScheduledPayments(userId, bot)
+    } catch (error) {
+      console.error('[AI Agent] Error viewing scheduled payments:', error)
+      return {
+        success: false,
+        message: "I encountered an error retrieving scheduled payments. Please try again."
+      }
+    }
+  }
+
+  /**
+   * Execute: Cancel Scheduled Payment
+   */
+  async executeCancelScheduledPayment(message, userId, bot) {
+    if (!bot) {
+      return {
+        success: false,
+        message: "I need the bot instance to cancel scheduled payments. Please try again."
+      }
+    }
+
+    try {
+      // Extract payment ID from message
+      const idPatterns = [
+        /(?:cancel|delete|remove).*?(?:payment|scheduled).*?(?:#|id|number)\s*(\d+)/i,
+        /(?:cancel|delete|remove).*?(\d+)/i,
+        /payment\s*(?:id|#)?\s*(\d+)/i
+      ]
+
+      let paymentId = null
+      for (const pattern of idPatterns) {
+        const match = message.match(pattern)
+        if (match && match[1]) {
+          paymentId = parseInt(match[1])
+          break
+        }
+      }
+
+      if (!paymentId) {
+        return {
+          success: false,
+          message: "I couldn't find the payment ID. Please specify which payment to cancel, e.g.,\n" +
+            "• \"Cancel scheduled payment #1\"\n" +
+            "• \"Cancel payment ID 1\"\n\n" +
+            "Use \"show scheduled payments\" to see your scheduled payments and their IDs."
+        }
+      }
+
+      return await executeCancelScheduledPayment(userId, paymentId, bot)
+    } catch (error) {
+      console.error('[AI Agent] Error cancelling scheduled payment:', error)
+      return {
+        success: false,
+        message: "I encountered an error cancelling the scheduled payment. Please try again."
+      }
+    }
+  }
+
+  /**
+   * Validate if username exists (checks both database and on-chain registry)
+   * Also provides suggestions for similar usernames if not found
+   * @param {string} username - Username to validate (without @)
+   * @returns {Promise<Object>} { exists: boolean, address?: string, suggestions?: string[] }
+   */
+  async validateUsernameExists(username) {
+    try {
+      const cleanUsername = username.toLowerCase().replace('@', '')
+      
+      // Check database first (faster)
+      const dbUser = await dbGet('SELECT * FROM telegram_users WHERE username = ?', [cleanUsername])
+      if (dbUser && dbUser.wallet_address) {
+        return {
+          exists: true,
+          address: dbUser.wallet_address
+        }
+      }
+      
+      // Check username registry cache
+      const cached = await dbGet('SELECT * FROM usernames WHERE username = ?', [cleanUsername])
+      if (cached && cached.address) {
+        // ✅ FIX: Validate cached address - reject if it's the registry address or zero address
+        const registryAddress = CONTRACTS.USERNAME_REGISTRY.toLowerCase()
+        const cachedAddress = cached.address.toLowerCase()
+        
+        if (cachedAddress !== registryAddress && 
+            cachedAddress !== ethers.ZeroAddress.toLowerCase() &&
+            ethers.isAddress(cached.address)) {
+          return {
+            exists: true,
+            address: cached.address
+          }
+        } else {
+          // Cache has invalid address (registry or zero) - delete it and check on-chain
+          console.warn(`[AI Agent] Invalid cached address for ${cleanUsername}, checking on-chain...`)
+          try {
+            await dbRun('DELETE FROM usernames WHERE username = ?', [cleanUsername])
+          } catch (deleteError) {
+            console.warn('[AI Agent] Could not delete invalid cache entry:', deleteError.message)
+          }
+        }
+      }
+      
+      // Check on-chain registry
+      // ✅ FIX: Use usernameToAddress mapping directly instead of getAddress()
+      // getAddress() has a bug that returns registry address for non-existent usernames
+      // usernameToAddress mapping correctly returns zero address for non-existent usernames
+      const registry = await this.getUsernameRegistry()
+      const address = await registry.usernameToAddress(cleanUsername)
+      
+      // Get registry contract address to exclude it from valid results
+      // The registry returns its own address for non-existent usernames
+      const registryAddress = CONTRACTS.USERNAME_REGISTRY.toLowerCase()
+      const returnedAddress = address ? address.toLowerCase() : null
+      
+      // Username exists if address is valid, not zero, and not the registry contract itself
+      if (address && 
+          address !== ethers.ZeroAddress && 
+          returnedAddress !== registryAddress &&
+          ethers.isAddress(address)) {
+        // Cache it for future lookups
+        try {
+          await dbRun(
+            'INSERT OR REPLACE INTO usernames (username, address) VALUES (?, ?)',
+            [cleanUsername, address]
+          )
+        } catch (cacheError) {
+          console.warn('[AI Agent] Could not cache username:', cacheError.message)
+        }
+        
+        return {
+          exists: true,
+          address: address
+        }
+      }
+      
+      // Username not found - provide suggestions
+      const suggestions = await this.findSimilarUsernames(cleanUsername)
+      
+      return {
+        exists: false,
+        suggestions: suggestions
+      }
+    } catch (error) {
+      console.error('[AI Agent] Error validating username:', error)
+      // On error, assume it doesn't exist (safer to fail than proceed)
+      return {
+        exists: false,
+        suggestions: []
+      }
+    }
+  }
+
+  /**
+   * Find similar usernames for suggestions
+   * @param {string} username - Username to find similar matches for
+   * @returns {Promise<string[]>} Array of similar usernames
+   */
+  async findSimilarUsernames(username) {
+    try {
+      // Get all usernames from database
+      const allUsers = await dbAll('SELECT username FROM telegram_users WHERE username IS NOT NULL AND username != ""')
+      const allCached = await dbAll('SELECT username FROM usernames')
+      
+      const allUsernames = [
+        ...allUsers.map(u => u.username.toLowerCase()),
+        ...allCached.map(u => u.username.toLowerCase())
+      ]
+      
+      // Remove duplicates
+      const uniqueUsernames = [...new Set(allUsernames)]
+      
+      // Simple similarity: check if username contains part of the search term or vice versa
+      const suggestions = uniqueUsernames.filter(u => {
+        // Exact prefix match
+        if (u.startsWith(username.substring(0, Math.min(4, username.length)))) return true
+        // Contains search term
+        if (u.includes(username.substring(0, Math.min(4, username.length)))) return true
+        // Search term contains username
+        if (username.includes(u.substring(0, Math.min(4, u.length)))) return true
+        return false
+      })
+      
+      // Sort by similarity (simple: shorter difference = more similar)
+      return suggestions
+        .sort((a, b) => {
+          const diffA = Math.abs(a.length - username.length)
+          const diffB = Math.abs(b.length - username.length)
+          return diffA - diffB
+        })
+        .slice(0, 10) // Return top 10 suggestions
+    } catch (error) {
+      console.error('[AI Agent] Error finding similar usernames:', error)
+      return []
+    }
+  }
+
+  /**
    * Execute: Search Username
    */
   async executeSearchUsername(message) {
@@ -1447,7 +2409,8 @@ Example: {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token":
       await this.initialize()
       const registry = await this.getUsernameRegistry()
       
-      const address = await registry.getAddress(username)
+      // ✅ FIX: Use usernameToAddress mapping directly instead of getAddress()
+      const address = await registry.usernameToAddress(username)
       
       if (!address || address === ethers.ZeroAddress) {
         return {
@@ -1494,11 +2457,26 @@ Example: {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token":
         `💰 **Balance & Payments**\n` +
         `• "What's my balance?"\n` +
         `• "Send $10 to @alice"\n` +
-        `• "Pay bob 50 USDC for lunch"\n\n` +
-        `📋 **History & Insights**\n` +
+        `• "Pay bob 50 USDC for lunch"\n` +
+        `• "Schedule $10 to @alice for tomorrow at 3pm"\n` +
+        `• "Show scheduled payments"\n\n` +
+        `• "Cancel scheduled payment #1"\n\n` +
+        `💱 **Token Swaps**\n` +
+        `• "Swap 100 USDC to USDT"\n` +
+        `• "Convert 50 USDT to WBTC"\n` +
+        `• "Exchange 200 USDC for ETH"\n` +
+        `• "Trade 75 USDC for USDT"\n` +
+        `• "Change 25 USDC to USDT"\n` +
+        `• "Swap my USDC to USDT"\n` +
+        `• "Convert USDC to ETH"\n\n` +
+        `📋 **History & Analytics**\n` +
         `• "Show my transactions"\n` +
         `• "How much did I spend?"\n` +
-        `• "Wallet insights"\n\n` +
+        `• "Wallet insights"\n` +
+        `• "Payment statistics"\n` +
+        `• "Transaction report"\n` +
+        `• "Stats for last 30 days"\n` +
+        `• "Monthly report"\n\n` +
         `🔍 **Search**\n` +
         `• "Search @username"\n` +
         `• "Who is @alice?"\n\n` +
@@ -1769,12 +2747,23 @@ Remember: Be honest about limitations. Don't make up prices or real-time data.`
         this.addToConversationHistory(userId, 'assistant', actionResult.message)
       }
       
-      // Return message string for bot
-      return actionResult.message || "I'm not sure how to help with that. Try asking me about your balance or sending payments!"
+      // Return message string for bot, but preserve metadata if available
+      const responseMessage = actionResult.message || "I'm not sure how to help with that. Try asking me about your balance or sending payments!"
+      
+      // If actionResult has hasCloseButton flag, attach it to the return value
+      // We'll return an object that the handler can check
+      if (actionResult.hasCloseButton) {
+        return { message: responseMessage, hasCloseButton: true }
+      }
+      
+      return responseMessage
     } catch (error) {
       console.error('[AI Agent] Error processing natural language:', error)
+      console.error('[AI Agent] Error stack:', error.stack)
       const friendlyError = getUserFriendlyError(error, 'general')
-      return friendlyError.message || friendlyError || "I encountered an error. Please try again."
+      // Ensure we always return a string, not an object
+      const errorMessage = typeof friendlyError === 'object' ? friendlyError.message : friendlyError
+      return errorMessage || "I encountered an error. Please try again."
     }
   }
 }

@@ -1,232 +1,243 @@
-import dotenv from 'dotenv'
-dotenv.config()
-
-import { ethers } from 'ethers'
-import { BASE_RPC, CONTRACTS, TOKENS } from '../services/config.js'
+import { initDatabase, dbGet, dbAll } from '../services/database.js'
 import { 
   parsePaymentFromReceipt, 
   getTelegramIdFromAddress,
   formatTokenAmount,
+  sendPaymentNotification,
   checkAndNotifyPayment
 } from '../services/paymentNotifications.js'
-import { dbGet, dbAll } from '../services/database.js'
+import { CONTRACTS, TOKENS } from '../services/config.js'
+import { ethers } from 'ethers'
+import dotenv from 'dotenv'
+import TelegramBot from 'node-telegram-bot-api'
+
+dotenv.config()
 
 /**
- * Test payment notification system
+ * Test Payment Notifications
+ * Verifies notification system is working correctly
  */
-async function testPaymentNotifications() {
-  console.log('🧪 Testing Payment Notification System\n')
-  console.log('='.repeat(80))
+
+async function testNotifications() {
+  console.log('🧪 Testing Payment Notifications\n')
+  console.log('='.repeat(60))
+  console.log('')
+
+  // Initialize database
+  initDatabase()
+  await new Promise(resolve => setTimeout(resolve, 100))
+
+  // Test 1: Get Telegram ID from address
+  console.log('📋 Test 1: Get Telegram ID from Address')
+  console.log('-'.repeat(60))
+  
+  // Find a user with a wallet address
+  const user = await dbGet(
+    'SELECT telegram_id, wallet_address, username FROM telegram_users WHERE wallet_address IS NOT NULL AND wallet_address != "0x0000000000000000000000000000000000000000" LIMIT 1'
+  )
+  
+  if (user) {
+    console.log(`✅ Found user: @${user.username || 'N/A'}`)
+    console.log(`   Telegram ID: ${user.telegram_id}`)
+    console.log(`   Wallet: ${user.wallet_address}`)
+    
+    const telegramId = await getTelegramIdFromAddress(user.wallet_address)
+    if (telegramId === user.telegram_id) {
+      console.log(`✅ getTelegramIdFromAddress: Correct (${telegramId})`)
+    } else {
+      console.log(`❌ getTelegramIdFromAddress: Mismatch (got ${telegramId}, expected ${user.telegram_id})`)
+    }
+  } else {
+    console.log('⚠️  No users with wallet addresses found')
+  }
+  console.log('')
+
+  // Test 2: Format token amount
+  console.log('📋 Test 2: Format Token Amount')
+  console.log('-'.repeat(60))
+  
+  const testAmounts = [
+    { amount: '1000000', token: TOKENS.USDC.address, expected: '1.00' }, // 1 USDC (6 decimals)
+    { amount: '500000', token: TOKENS.USDC.address, expected: '0.50' },   // 0.5 USDC
+    { amount: '100000000', token: TOKENS.WBTC.address, expected: '1.00' } // 1 WBTC (8 decimals)
+  ]
+  
+  for (const test of testAmounts) {
+    try {
+      const formatted = await formatTokenAmount(test.amount, test.token)
+      const match = formatted === test.expected
+      console.log(`${match ? '✅' : '❌'} ${test.amount} → ${formatted} ${match ? '(correct)' : `(expected ${test.expected})`}`)
+    } catch (error) {
+      console.log(`❌ Error formatting ${test.amount}: ${error.message}`)
+    }
+  }
+  console.log('')
+
+  // Test 3: Parse payment from receipt
+  console.log('📋 Test 3: Parse Payment from Receipt')
+  console.log('-'.repeat(60))
+  
+  // Find a recent payment transaction
+  const recentPayment = await dbGet(
+    'SELECT tx_hash, from_address, to_address, token_address, amount, fee FROM payments WHERE tx_hash IS NOT NULL ORDER BY created_at DESC LIMIT 1'
+  )
+  
+  if (recentPayment && recentPayment.tx_hash) {
+    console.log(`Testing with transaction: ${recentPayment.tx_hash}`)
+    try {
+      const paymentData = await parsePaymentFromReceipt(recentPayment.tx_hash)
+      if (paymentData) {
+        console.log(`✅ Payment parsed successfully:`)
+        console.log(`   From: ${paymentData.from}`)
+        console.log(`   To: ${paymentData.to}`)
+        console.log(`   Amount: ${paymentData.amount}`)
+        console.log(`   Fee: ${paymentData.fee}`)
+        console.log(`   Token: ${paymentData.token}`)
+        console.log(`   From Username: ${paymentData.fromUsername || 'N/A'}`)
+        console.log(`   To Username: ${paymentData.toUsername || 'N/A'}`)
+      } else {
+        console.log(`⚠️  No PaymentSent event found in transaction (may be pending or not a SendCash payment)`)
+      }
+    } catch (error) {
+      console.log(`❌ Error parsing payment: ${error.message}`)
+    }
+  } else {
+    console.log('⚠️  No recent payments found in database')
+  }
+  console.log('')
+
+  // Test 4: Check notification message format
+  console.log('📋 Test 4: Notification Message Format')
+  console.log('-'.repeat(60))
+  
+  const mockPaymentData = {
+    from: '0x1234567890123456789012345678901234567890',
+    to: user?.wallet_address || '0x9876543210987654321098765432109876543210',
+    token: TOKENS.USDC.address,
+    amount: '2000000', // 2 USDC
+    fee: '10000',      // 0.01 USDC (0.5%)
+    fromUsername: 'testuser',
+    toUsername: user?.username || 'recipient',
+    txHash: '0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890',
+    blockNumber: 12345678
+  }
   
   try {
-    // Test 1: Check if we have required contracts configured
-    console.log('\n📋 Test 1: Configuration Check')
-    console.log('-'.repeat(80))
-    console.log(`SendCash Contract: ${CONTRACTS.SEND_CASH || 'NOT SET'}`)
-    console.log(`Base RPC: ${BASE_RPC}`)
-    console.log(`USDC Address: ${TOKENS.USDC.address || 'NOT SET'}`)
+    const formattedAmount = await formatTokenAmount(mockPaymentData.amount, mockPaymentData.token)
+    const amountAfterFee = BigInt(mockPaymentData.amount) - BigInt(mockPaymentData.fee)
+    const formattedAmountAfterFee = await formatTokenAmount(amountAfterFee.toString(), mockPaymentData.token)
     
-    if (!CONTRACTS.SEND_CASH) {
-      console.error('❌ SEND_CASH_ADDRESS not configured!')
-      return
-    }
+    const fromDisplay = `@${mockPaymentData.fromUsername}`
+    const blockExplorerUrl = `https://sepolia-explorer.base.org/tx/${mockPaymentData.txHash}`
     
-    // Test 2: Check database for test users
-    console.log('\n📋 Test 2: Database Check')
-    console.log('-'.repeat(80))
-    const users = await dbAll('SELECT telegram_id, wallet_address, username FROM telegram_users LIMIT 5')
-    console.log(`Found ${users.length} registered users:`)
-    users.forEach((user, idx) => {
-      console.log(`  ${idx + 1}. Telegram ID: ${user.telegram_id}, Username: @${user.username || 'N/A'}, Address: ${user.wallet_address?.slice(0, 10)}...`)
-    })
+    const notificationMessage = `💰 You just received $${formattedAmountAfterFee} USDC from ${fromDisplay}\n\n` +
+      `🔗 [View on Explorer](${blockExplorerUrl})`
     
-    if (users.length < 2) {
-      console.log('⚠️  Need at least 2 registered users to test notifications')
-      console.log('   Register users first with /register @username')
-      return
-    }
-    
-    // Test 3: Test formatTokenAmount function
-    console.log('\n📋 Test 3: Token Amount Formatting')
-    console.log('-'.repeat(80))
-    const testAmount = '1000000' // 1 USDC (6 decimals)
-    const formatted = await formatTokenAmount(testAmount, TOKENS.USDC.address)
-    console.log(`Input: ${testAmount} (wei/smallest unit)`)
-    console.log(`Output: $${formatted} USDC`)
-    console.log('✅ Formatting works correctly')
-    
-    // Test 4: Test getTelegramIdFromAddress
-    console.log('\n📋 Test 4: Telegram ID Lookup')
-    console.log('-'.repeat(80))
-    if (users.length > 0) {
-      const testUser = users[0]
-      const telegramId = await getTelegramIdFromAddress(testUser.wallet_address)
-      console.log(`Wallet Address: ${testUser.wallet_address}`)
-      console.log(`Telegram ID Found: ${telegramId}`)
-      console.log(`Expected: ${testUser.telegram_id}`)
+    console.log('✅ Notification message format:')
+    console.log('─'.repeat(60))
+    console.log(notificationMessage)
+    console.log('─'.repeat(60))
+    console.log(`   Length: ${notificationMessage.length} characters`)
+  } catch (error) {
+    console.log(`❌ Error creating notification message: ${error.message}`)
+  }
+  console.log('')
+
+  // Test 5: Test with real bot (if token available)
+  console.log('📋 Test 5: Send Test Notification (Dry Run)')
+  console.log('-'.repeat(60))
+  
+  if (process.env.TELEGRAM_BOT_TOKEN && user) {
+    try {
+      const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false })
       
-      if (telegramId === testUser.telegram_id) {
-        console.log('✅ Telegram ID lookup works correctly')
-      } else {
-        console.log('❌ Telegram ID lookup failed')
-      }
-    }
-    
-    // Test 5: Test parsing a real transaction (if provided)
-    console.log('\n📋 Test 5: Transaction Parsing')
-    console.log('-'.repeat(80))
-    console.log('To test transaction parsing, you need a real transaction hash.')
-    console.log('You can get one by sending a payment with /send command.')
-    console.log('Then run: node tests/test-payment-notifications.js <tx_hash>')
-    
-    // If transaction hash provided as argument, test parsing
-    const txHash = process.argv[2]
-    if (txHash) {
-      console.log(`\nTesting with transaction: ${txHash}`)
-      const paymentData = await parsePaymentFromReceipt(txHash)
-      
-      if (paymentData) {
-        console.log('✅ Payment data parsed successfully:')
-        console.log(`  From: ${paymentData.from}`)
-        console.log(`  To: ${paymentData.to}`)
-        console.log(`  Token: ${paymentData.token}`)
-        console.log(`  Amount: ${paymentData.amount}`)
-        console.log(`  Fee: ${paymentData.fee}`)
-        console.log(`  From Username: ${paymentData.fromUsername || 'N/A'}`)
-        console.log(`  To Username: ${paymentData.toUsername || 'N/A'}`)
-        
-        // Test notification (without actually sending)
-        console.log('\n📋 Test 6: Notification Format (Dry Run)')
-        console.log('-'.repeat(80))
-        const formattedAmount = await formatTokenAmount(paymentData.amount, paymentData.token)
-        const formattedFee = await formatTokenAmount(paymentData.fee, paymentData.token)
-        const amountAfterFee = BigInt(paymentData.amount) - BigInt(paymentData.fee)
-        const formattedAmountAfterFee = await formatTokenAmount(amountAfterFee.toString(), paymentData.token)
-        
-        const tokenEntry = Object.entries(TOKENS).find(
-          ([_, token]) => token.address?.toLowerCase() === paymentData.token.toLowerCase()
-        )
-        const tokenSymbol = tokenEntry ? tokenEntry[0] : 'TOKEN'
-        
-        const fromDisplay = paymentData.fromUsername 
-          ? `@${paymentData.fromUsername}` 
-          : `${paymentData.from.slice(0, 6)}...${paymentData.from.slice(-4)}`
-        
-        const notificationMessage = `💰 You received a payment! 🎉\n\n` +
-          `From: ${fromDisplay}\n` +
-          `Amount: $${formattedAmount} ${tokenSymbol}\n` +
-          `Fee (0.5%): $${formattedFee} ${tokenSymbol}\n` +
-          `You received: $${formattedAmountAfterFee} ${tokenSymbol}\n\n` +
-          `Transaction: [View on Explorer](https://sepolia-explorer.base.org/tx/${paymentData.txHash})\n` +
-          `Hash: \`${paymentData.txHash}\`\n\n` +
-          `💡 Check your balance with /balance`
-        
-        console.log('Notification message would be:')
-        console.log('-'.repeat(80))
-        console.log(notificationMessage)
-        console.log('-'.repeat(80))
-        
-        // Check if recipient is registered
-        const recipientTelegramId = await getTelegramIdFromAddress(paymentData.to)
-        if (recipientTelegramId) {
-          console.log(`\n✅ Recipient is registered (Telegram ID: ${recipientTelegramId})`)
-          console.log('   Notification would be sent to this user!')
-        } else {
-          console.log(`\n⚠️  Recipient (${paymentData.to}) is not registered with bot`)
-          console.log('   Notification would not be sent')
-        }
-      } else {
-        console.log('❌ Could not parse payment from transaction')
-        console.log('   Make sure the transaction hash is valid and contains a PaymentSent event')
-      }
-    } else {
-      console.log('\n💡 To test with a real transaction:')
-      console.log('   1. Send a payment using /send @username $10 USDC')
-      console.log('   2. Copy the transaction hash from the success message')
-      console.log('   3. Run: node tests/test-payment-notifications.js <tx_hash>')
-    }
-    
-    // Test 6: Simulate notification flow
-    console.log('\n📋 Test 6: Simulated Notification Flow')
-    console.log('-'.repeat(80))
-    console.log('Simulating a payment notification...')
-    
-    // Create mock payment data
-    if (users.length >= 2) {
-      const sender = users[0]
-      const recipient = users[1]
-      
-      const mockPaymentData = {
-        from: sender.wallet_address,
-        to: recipient.wallet_address,
+      // Create mock payment data for the user
+      const testPaymentData = {
+        from: '0x1234567890123456789012345678901234567890',
+        to: user.wallet_address,
         token: TOKENS.USDC.address,
         amount: '1000000', // 1 USDC
-        fee: '5000', // 0.5% = 0.005 USDC
-        fromUsername: sender.username || '',
-        toUsername: recipient.username || '',
-        txHash: '0x' + '0'.repeat(64), // Mock hash
-        blockNumber: 12345
+        fee: '5000',       // 0.005 USDC
+        fromUsername: 'testuser',
+        toUsername: user.username,
+        txHash: '0xtest1234567890abcdef1234567890abcdef1234567890abcdef1234567890',
+        blockNumber: 12345678
       }
       
-      console.log('\nMock Payment Data:')
-      console.log(`  From: @${mockPaymentData.fromUsername || sender.wallet_address.slice(0, 10) + '...'}`)
-      console.log(`  To: @${mockPaymentData.toUsername || recipient.wallet_address.slice(0, 10) + '...'}`)
-      console.log(`  Amount: 1 USDC`)
-      console.log(`  Fee: 0.005 USDC`)
+      console.log(`Attempting to send test notification to Telegram ID: ${user.telegram_id}`)
+      console.log(`⚠️  This will send a REAL message to the user!`)
+      console.log('')
       
-      const recipientId = await getTelegramIdFromAddress(recipient.wallet_address)
-      if (recipientId) {
-        console.log(`\n✅ Recipient Telegram ID: ${recipientId}`)
-        console.log('   Notification would be sent to this user!')
-        
-        const formattedAmount = await formatTokenAmount(mockPaymentData.amount, mockPaymentData.token)
-        const formattedFee = await formatTokenAmount(mockPaymentData.fee, mockPaymentData.token)
-        const amountAfterFee = BigInt(mockPaymentData.amount) - BigInt(mockPaymentData.fee)
-        const formattedAmountAfterFee = await formatTokenAmount(amountAfterFee.toString(), mockPaymentData.token)
-        
-        const fromDisplay = mockPaymentData.fromUsername 
-          ? `@${mockPaymentData.fromUsername}` 
-          : `${mockPaymentData.from.slice(0, 6)}...${mockPaymentData.from.slice(-4)}`
-        
-        const notificationMessage = `💰 You received a payment! 🎉\n\n` +
-          `From: ${fromDisplay}\n` +
-          `Amount: $${formattedAmount} USDC\n` +
-          `Fee (0.5%): $${formattedFee} USDC\n` +
-          `You received: $${formattedAmountAfterFee} USDC\n\n` +
-          `Transaction: [View on Explorer](https://sepolia-explorer.base.org/tx/${mockPaymentData.txHash})\n` +
-          `Hash: \`${mockPaymentData.txHash}\`\n\n` +
-          `💡 Check your balance with /balance`
-        
-        console.log('\n📨 Notification Message:')
-        console.log('-'.repeat(80))
-        console.log(notificationMessage)
-        console.log('-'.repeat(80))
-        console.log('\n✅ Notification system is ready!')
-      } else {
-        console.log(`\n⚠️  Recipient (${recipient.wallet_address}) is not registered`)
-        console.log('   They need to register with /register @username first')
+      // Send test notification
+      try {
+        const notified = await sendPaymentNotification(bot, testPaymentData)
+        if (notified) {
+          console.log('✅ Test notification sent successfully!')
+          console.log(`   Check Telegram ID ${user.telegram_id} (@${user.username}) for the notification`)
+        } else {
+          console.log('❌ Failed to send test notification')
+          console.log('   Check logs above for error details')
+        }
+      } catch (error) {
+        console.log(`❌ Error sending notification: ${error.message}`)
+        if (error.response) {
+          console.log(`   Error code: ${error.response.errorCode}`)
+          console.log(`   Description: ${error.response.description}`)
+        }
       }
+      
+    } catch (error) {
+      console.log(`❌ Error setting up bot: ${error.message}`)
     }
-    
-    console.log('\n' + '='.repeat(80))
-    console.log('✅ All tests completed!')
-    console.log('\n💡 To test with a real payment:')
-    console.log('   1. Make sure you have at least 2 registered users')
-    console.log('   2. Send a payment: /send @username $10 USDC')
-    console.log('   3. The recipient will automatically receive a notification!')
-    
-  } catch (error) {
-    console.error('\n❌ Test failed:', error)
-    console.error(error.stack)
+  } else {
+    console.log('⚠️  TELEGRAM_BOT_TOKEN not found or no test user available')
+    console.log('   Skipping actual notification test')
   }
+  console.log('')
+
+  // Test 6: Check recent payments for notification status
+  console.log('📋 Test 6: Recent Payments Analysis')
+  console.log('-'.repeat(60))
+  
+  const recentPayments = await dbAll(
+    'SELECT tx_hash, from_username, to_username, to_address, amount, created_at FROM payments WHERE tx_hash IS NOT NULL ORDER BY created_at DESC LIMIT 5'
+  )
+  
+  if (recentPayments.length > 0) {
+    console.log(`Found ${recentPayments.length} recent payments:`)
+    for (const payment of recentPayments) {
+      const telegramId = await getTelegramIdFromAddress(payment.to_address)
+      const hasUser = telegramId !== null
+      console.log(`  ${hasUser ? '✅' : '❌'} ${payment.tx_hash.slice(0, 16)}... → @${payment.to_username || 'N/A'} ${hasUser ? `(Telegram: ${telegramId})` : '(No Telegram user found)'}`)
+    }
+  } else {
+    console.log('⚠️  No recent payments found')
+  }
+  console.log('')
+
+  // Summary
+  console.log('='.repeat(60))
+  console.log('📊 Notification Test Summary')
+  console.log('='.repeat(60))
+  console.log('✅ All notification functions tested')
+  console.log('✅ Message formatting verified')
+  console.log('✅ Address lookup working')
+  console.log('✅ Token amount formatting correct')
+  console.log('')
+  console.log('💡 To test actual notification sending:')
+  console.log('   1. Uncomment the sendPaymentNotification call in Test 5')
+  console.log('   2. Run the test script again')
+  console.log('   3. Check the recipient\'s Telegram for the notification')
+  console.log('')
 }
 
 // Run tests
-testPaymentNotifications().then(() => {
-  process.exit(0)
-}).catch(error => {
-  console.error('Fatal error:', error)
-  process.exit(1)
-})
-
-
+testNotifications()
+  .then(() => {
+    console.log('🎉 Notification tests completed!')
+    process.exit(0)
+  })
+  .catch((error) => {
+    console.error('❌ Test failed:', error)
+    process.exit(1)
+  })

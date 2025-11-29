@@ -188,11 +188,22 @@ contract UsernameRegistry is Ownable, ReentrancyGuard {
      * @dev Get address for a username
      * @param username The username to lookup
      * @return The address associated with the username
+     *         Returns address(0) if username doesn't exist.
+     *         ✅ FIX: Explicitly ensure we never return the contract's own address,
+     *         which would indicate a bug. Always return address(0) for non-existent usernames.
      */
     function getAddress(
         string memory username
     ) external view returns (address) {
-        return usernameToAddress[username];
+        address result = usernameToAddress[username];
+
+        // ✅ SAFEGUARD: Never return the contract's own address (indicates a bug)
+        // If mapping somehow returns this contract's address, treat it as non-existent
+        if (result == address(this)) {
+            return address(0);
+        }
+
+        return result;
     }
 
     /**

@@ -8,11 +8,12 @@ import { paymentRoutes } from './routes/payment.js'
 import { transactionRoutes } from './routes/transactions.js'
 // import { botHandlers } from './bot/handlers.js' // Disabled - using Sender AI
 import { senderBotHandlers } from './bot/senderHandlers.js'
+import { getPaymentScheduler } from './services/paymentScheduler.js'
 
 dotenv.config()
 
 const app = express()
-const PORT = process.env.PORT || 5000
+const PORT = process.env.PORT || 5001
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN
 
 // Middleware
@@ -51,8 +52,13 @@ if (TELEGRAM_BOT_TOKEN) {
   // Register Sender AI bot handlers
   senderBotHandlers(bot)
   
+  // Start payment scheduler
+  const scheduler = getPaymentScheduler(bot)
+  scheduler.start()
+  
   console.log('🤖 Sender AI bot initialized')
   console.log(`[Sender] Ready to chat! Users can now talk naturally with Sender AI`)
+  console.log('📅 Payment scheduler started')
 } else {
   console.warn('TELEGRAM_BOT_TOKEN not set, bot disabled')
 }
@@ -63,15 +69,14 @@ app.listen(PORT, () => {
   console.log(`API available at http://localhost:${PORT}/api`)
 }).on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
-    console.error(`❌ Port ${PORT} is already in use.`)
-    console.error(`   Please either:`)
-    console.error(`   1. Stop the process using port ${PORT}`)
-    console.error(`   2. Or set a different PORT in .env file`)
-    console.error(`\n   To find what's using port ${PORT}, run:`)
-    console.error(`   lsof -ti:${PORT}`)
-    process.exit(1)
+    console.warn(`⚠️  Port ${PORT} is already in use. HTTP server not started.`)
+    console.warn(`   Bot will continue running, but API endpoints won't be available.`)
+    console.warn(`   To fix: Stop the process using port ${PORT} or set a different PORT in .env`)
+    console.warn(`   Find what's using port ${PORT}: lsof -ti:${PORT}`)
+    // Don't exit - let the bot continue running
   } else {
     console.error('Server error:', err)
+    // Only exit on non-port errors
     process.exit(1)
   }
 })

@@ -83,6 +83,55 @@ export const initDatabase = () => {
     )
   `)
   
+  // Scheduled payments
+  db.run(`
+    CREATE TABLE IF NOT EXISTS scheduled_payments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      recipient_username TEXT NOT NULL,
+      amount TEXT NOT NULL,
+      token_symbol TEXT NOT NULL,
+      token_address TEXT NOT NULL,
+      memo TEXT,
+      scheduled_for INTEGER NOT NULL,
+      status TEXT DEFAULT 'pending',
+      tx_hash TEXT,
+      created_at INTEGER DEFAULT (strftime('%s', 'now')),
+      FOREIGN KEY (user_id) REFERENCES telegram_users(telegram_id)
+    )
+  `)
+  
+  // Create index for faster queries
+  db.run(`
+    CREATE INDEX IF NOT EXISTS idx_scheduled_payments_status 
+    ON scheduled_payments(status, scheduled_for)
+  `)
+  
+  // Swaps tracking
+  db.run(`
+    CREATE TABLE IF NOT EXISTS swaps (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      from_token TEXT NOT NULL,
+      to_token TEXT NOT NULL,
+      from_amount TEXT NOT NULL,
+      to_amount TEXT,
+      tx_hash TEXT,
+      status TEXT DEFAULT 'pending',
+      price_impact TEXT,
+      slippage_bps INTEGER DEFAULT 100,
+      pool_address TEXT,
+      created_at INTEGER DEFAULT (strftime('%s', 'now')),
+      FOREIGN KEY (user_id) REFERENCES telegram_users(telegram_id)
+    )
+  `)
+  
+  // Create index for faster swap queries
+  db.run(`
+    CREATE INDEX IF NOT EXISTS idx_swaps_user_status 
+    ON swaps(user_id, status, created_at)
+  `)
+  
   console.log('Database initialized')
 }
 

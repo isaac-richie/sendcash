@@ -57,8 +57,20 @@ export const senderBotHandlers = (bot) => {
 
   // Handle all messages through Sender AI
   bot.on('message', async (msg) => {
+    // Log all incoming messages for debugging
+    console.log(`[Sender] 📨 Received message:`, {
+      chatId: msg.chat?.id,
+      userId: msg.from?.id,
+      username: msg.from?.username,
+      text: msg.text?.substring(0, 50),
+      hasText: !!msg.text
+    })
+    
     // Skip non-text messages
-    if (!msg.text) return
+    if (!msg.text) {
+      console.log(`[Sender] Skipping non-text message`)
+      return
+    }
     
     const chatId = msg.chat.id
     const userId = msg.from.id
@@ -130,24 +142,42 @@ export const senderBotHandlers = (bot) => {
         },
         bot
       )
-      console.log(`[Sender] AI response generated:`, aiResponse ? `${aiResponse.substring(0, 100)}...` : 'null')
+      // Handle both string and object responses
+      const responseMessage = typeof aiResponse === 'object' ? aiResponse.message : aiResponse
+      const hasCloseButton = typeof aiResponse === 'object' ? aiResponse.hasCloseButton : false
+      
+      console.log(`[Sender] AI response generated:`, responseMessage ? `${responseMessage.substring(0, 100)}...` : 'null')
       
       // Check if response indicates needsConfirmation
-      if (aiResponse && aiResponse.includes('Reply "yes" or "confirm"')) {
+      if (responseMessage && responseMessage.includes('Reply "yes" or "confirm"')) {
         console.log(`[Sender] ✅ Payment confirmation prompt sent to user`)
       }
 
       // Send response
-      if (aiResponse) {
+      if (responseMessage) {
         // Check if this is a private key export that needs auto-deletion
-        // We need to check the action result to see if auto-delete is enabled
-        // For now, we'll handle it by checking if the message contains private key indicators
-        const isPrivateKeyMessage = aiResponse.includes('Your Private Key:') || 
-                                     aiResponse.includes('🔐 **Your Private Key:**');
+        const isPrivateKeyMessage = responseMessage.includes('Your Private Key:') || 
+                                     responseMessage.includes('🔐 **Your Private Key:**');
         
-        const sentMessage = await bot.sendMessage(chatId, aiResponse, { 
+        // Check if this is a list view that needs a close button
+        // Either from the hasCloseButton flag or by detecting list view patterns
+        const isListView = hasCloseButton ||
+                          responseMessage.includes('📋 **Your Recent Transactions:**') ||
+                          responseMessage.includes('📅 **Scheduled Payments**') ||
+                          responseMessage.includes('📊 **Your Wallet Insights:**') ||
+                          responseMessage.includes('**Your Transaction History:**');
+        
+        // Create inline keyboard with close button for list views
+        const replyMarkup = isListView ? {
+          inline_keyboard: [[
+            { text: '❌ Close', callback_data: 'close_message' }
+          ]]
+        } : undefined;
+        
+        const sentMessage = await bot.sendMessage(chatId, responseMessage, { 
           parse_mode: 'Markdown',
-          disable_web_page_preview: true
+          disable_web_page_preview: true,
+          reply_markup: replyMarkup
         });
         
         // Auto-delete private key messages after 5 seconds
@@ -182,6 +212,35 @@ export const senderBotHandlers = (bot) => {
         `• "Help me"`,
         { parse_mode: 'Markdown' }
       )
+    }
+  })
+
+  // Handle callback queries (inline button clicks)
+  bot.on('callback_query', async (query) => {
+    const chatId = query.message.chat.id
+    const messageId = query.message.message_id
+    const data = query.data
+
+    // Answer the callback query to remove loading state
+    await bot.answerCallbackQuery(query.id)
+
+    if (data === 'close_message') {
+      try {
+        await bot.deleteMessage(chatId, messageId)
+        console.log(`[Sender] User ${query.from.id} closed message ${messageId}`)
+      } catch (error) {
+        // Message might already be deleted or bot doesn't have permission
+        console.warn(`[Sender] Could not delete message:`, error.message)
+        // Try to edit the message instead
+        try {
+          await bot.editMessageText('✅ Closed', {
+            chat_id: chatId,
+            message_id: messageId
+          })
+        } catch (editError) {
+          console.warn(`[Sender] Could not edit message:`, editError.message)
+        }
+      }
     }
   })
 

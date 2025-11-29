@@ -45,10 +45,12 @@ export const prepareSendTransaction = async (fromAddress, toUsername, tokenSymbo
     const provider = getProvider()
     const sendCash = getSendCash()
 
-    // Get recipient address from username (use getAddress for consistency with SendCash contract)
+    // Get recipient address from username
+    // ✅ FIX: Use usernameToAddress mapping directly instead of getAddress()
+    // getAddress() has a bug that returns registry address for non-existent usernames
     const registry = getUsernameRegistry()
     
-    const toAddress = await registry.getAddress(toUsername.toLowerCase())
+    const toAddress = await registry.usernameToAddress(toUsername.toLowerCase())
     if (!toAddress || toAddress === ethers.ZeroAddress) {
       throw new Error('Username not found')
     }

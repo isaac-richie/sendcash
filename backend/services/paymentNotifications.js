@@ -14,6 +14,7 @@ const SEND_CASH_ABI = [
 
 /**
  * Parse PaymentSent event from transaction receipt
+ * Handles both direct transactions and account abstraction (UserOperations)
  * @param {string} txHash - Transaction hash
  * @returns {Promise<Object|null>} Payment data or null if not found
  */
@@ -33,39 +34,71 @@ export const parsePaymentFromReceipt = async (txHash) => {
       provider
     )
 
-    // Find PaymentSent event in logs
-    const eventFilter = sendCashContract.filters.PaymentSent()
-    const events = receipt.logs.filter(log => {
-      try {
-        return log.topics[0] === eventFilter.topics[0]
-      } catch {
-        return false
-      }
-    })
+    // Get the event signature for PaymentSent
+    const paymentSentTopic = ethers.id('PaymentSent(address,address,address,uint256,uint256,string,string)')
 
-    if (events.length === 0) {
-      return null
+    // Search all logs for PaymentSent event
+    // This works for both direct calls and account abstraction (UserOperations)
+    let paymentEvent = null
+    
+    for (const log of receipt.logs) {
+      // Check if this log is from SendCash contract
+      if (log.address.toLowerCase() !== CONTRACTS.SEND_CASH.toLowerCase()) {
+        continue
+      }
+      
+      // Check if this is a PaymentSent event
+      if (log.topics[0] === paymentSentTopic) {
+        try {
+          const parsedEvent = sendCashContract.interface.parseLog({
+            topics: log.topics,
+            data: log.data
+          })
+
+          if (parsedEvent && parsedEvent.name === 'PaymentSent') {
+            paymentEvent = parsedEvent
+            break
+          }
+        } catch (parseError) {
+          // Continue searching if parsing fails
+          continue
+        }
+      }
     }
 
-    // Parse the first PaymentSent event
-    const event = events[0]
-    const parsedEvent = sendCashContract.interface.parseLog({
-      topics: event.topics,
-      data: event.data
-    })
+    if (!paymentEvent) {
+      // If not found in logs, try querying events from the block
+      // This helps with account abstraction where events might be in inner transactions
+      try {
+        const block = await provider.getBlock(receipt.blockNumber)
+        const filter = sendCashContract.filters.PaymentSent()
+        const events = await sendCashContract.queryFilter(filter, block.number, block.number)
+        
+        // Find event that matches our transaction
+        for (const event of events) {
+          if (event.transactionHash === txHash || 
+              (event.log && event.log.transactionHash === txHash)) {
+            paymentEvent = event
+            break
+          }
+        }
+      } catch (queryError) {
+        console.log(`[PaymentNotifications] Could not query events from block: ${queryError.message}`)
+      }
+    }
 
-    if (!parsedEvent || parsedEvent.name !== 'PaymentSent') {
+    if (!paymentEvent) {
       return null
     }
 
     return {
-      from: parsedEvent.args.from,
-      to: parsedEvent.args.to,
-      token: parsedEvent.args.token,
-      amount: parsedEvent.args.amount.toString(),
-      fee: parsedEvent.args.fee.toString(),
-      fromUsername: parsedEvent.args.fromUsername,
-      toUsername: parsedEvent.args.toUsername,
+      from: paymentEvent.args.from,
+      to: paymentEvent.args.to,
+      token: paymentEvent.args.token,
+      amount: paymentEvent.args.amount.toString(),
+      fee: paymentEvent.args.fee.toString(),
+      fromUsername: paymentEvent.args.fromUsername,
+      toUsername: paymentEvent.args.toUsername,
       txHash: txHash,
       blockNumber: receipt.blockNumber
     }
@@ -157,7 +190,7 @@ export const sendPaymentNotification = async (bot, paymentData) => {
     const formattedAmountAfterFee = await formatTokenAmount(amountAfterFee.toString(), paymentData.token)
     const formattedFee = await formatTokenAmount(paymentData.fee, paymentData.token)
 
-    // Build notification message
+    // Build notification message - simple and friendly
     const blockExplorerUrl = `https://sepolia-explorer.base.org/tx/${paymentData.txHash}`
     
     const fromDisplay = paymentData.fromUsername 
@@ -167,19 +200,11 @@ export const sendPaymentNotification = async (bot, paymentData) => {
     // Get memo from database if available
     const { dbGet } = await import('./database.js')
     const paymentRecord = await dbGet('SELECT memo FROM payments WHERE tx_hash = ?', [paymentData.txHash])
-    const memoText = paymentRecord?.memo ? `\n📝 Note: ${paymentRecord.memo}` : ''
+    const memoText = paymentRecord?.memo ? `\n\n📝 "${paymentRecord.memo}"` : ''
     
-    const notificationMessage = `🔔 **NEW PAYMENT ALERT** 🔔\n\n` +
-      `💰 **You received a payment!**\n\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n` +
-      `👤 **From:** ${fromDisplay}\n` +
-      `💵 **Amount:** $${formattedAmount} ${tokenSymbol}${memoText}\n` +
-      `📊 **Fee (0.5%):** $${formattedFee} ${tokenSymbol}\n` +
-      `✅ **You received:** $${formattedAmountAfterFee} ${tokenSymbol}\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n\n` +
-      `🔗 [View Transaction on Explorer](${blockExplorerUrl})\n` +
-      `📋 Hash: \`${paymentData.txHash.slice(0, 16)}...\`\n\n` +
-      `💡 Check your balance: /balance`
+    // Simple, friendly message
+    const notificationMessage = `💰 You just received $${formattedAmountAfterFee} ${tokenSymbol} from ${fromDisplay}${memoText}\n\n` +
+      `🔗 [View on Explorer](${blockExplorerUrl})`
 
     // Send notification
     await bot.sendMessage(telegramId, notificationMessage, { parse_mode: 'Markdown' })
@@ -196,7 +221,6 @@ export const sendPaymentNotification = async (bot, paymentData) => {
     }
     
     return false
-  }
   }
 }
 

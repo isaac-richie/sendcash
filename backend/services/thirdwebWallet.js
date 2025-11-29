@@ -869,8 +869,9 @@ export const registerUsernameInRegistry = async (username, walletAddress, feePay
     const { getUsernameRegistry } = await import('./contracts.js');
     const registry = getUsernameRegistry();
 
-    // Check if already registered (use getAddress for consistency)
-    const existingAddress = await registry.getAddress(username.toLowerCase());
+    // Check if already registered
+    // ✅ FIX: Use usernameToAddress mapping directly instead of getAddress()
+    const existingAddress = await registry.usernameToAddress(username.toLowerCase());
     if (existingAddress && existingAddress.toLowerCase() === walletAddress.toLowerCase()) {
       return { alreadyRegistered: true, txHash: null };
     }

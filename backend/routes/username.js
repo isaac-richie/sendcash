@@ -21,7 +21,8 @@ router.get('/:username', async (req, res) => {
     const { getUsernameRegistry } = await import('../services/contracts.js')
     const registry = getUsernameRegistry()
     
-    const address = await registry.getAddress(cleanUsername)
+    // ✅ FIX: Use usernameToAddress mapping directly instead of getAddress()
+    const address = await registry.usernameToAddress(cleanUsername)
     if (address && address !== ethers.ZeroAddress) {
       // Cache it
       await dbRun(

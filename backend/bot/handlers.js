@@ -254,7 +254,8 @@ Send money via @username - it's that simple!
       )
 
       // Verify username is registered on-chain (reuse registry instance from above)
-      const registeredAddress = await registry.getAddress(username.toLowerCase())
+      // ✅ FIX: Use usernameToAddress mapping directly instead of getAddress()
+      const registeredAddress = await registry.usernameToAddress(username.toLowerCase())
 
       const response = `✅ Welcome to SendCash, @${username}! 🎉\n\n` +
         `Your smart wallet has been created!\n\n` +
