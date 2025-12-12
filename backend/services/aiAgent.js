@@ -39,16 +39,14 @@ class SendCashAI {
       analysis: new Map(), // wallet address -> { data, timestamp }
       intents: new Map(), // message hash -> { intent, timestamp }
       paymentIntents: new Map(), // message hash -> { intent, timestamp }
-      markets: new Map(), // search query -> { data, timestamp }
-      predictions: new Map() // search query -> { data, timestamp }
+      markets: new Map() // search query -> { data, timestamp }
     }
     this.cacheTTL = {
-      balances: 60000, // 60 seconds (increased for better cache hit rate)
-      analysis: 120000, // 2 minutes (increased)
-      intents: 600000, // 10 minutes (increased)
-      paymentIntents: 600000, // 10 minutes (increased)
-      markets: 300000, // 5 minutes (markets don't change too frequently)
-      predictions: 300000 // 5 minutes (predictions update periodically)
+      balances: 60000, // 60 seconds
+      analysis: 120000, // 2 minutes
+      intents: 600000, // 10 minutes
+      paymentIntents: 600000, // 10 minutes
+      markets: 300000 // 5 minutes
     }
     
     // Request queue for OpenAI API (rate limiting)
@@ -236,9 +234,8 @@ class SendCashAI {
     if (this.initialized) return
     
     // Get contract instances
-    this.sendCashContract = await this.getSendCashContract()
+    this.sendCash = await this.getSendCashContract()
     this.usernameRegistry = await this.getUsernameRegistry()
-    // Note: sendCashContract is the same as sendCash, no need to duplicate
     
     this.initialized = true
     console.log('[AI Agent] Initialized and ready')
@@ -1171,7 +1168,6 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
       // Try manual extraction first (fast, no API call)
       const manualExtract = this.manualExtractPayment(message)
       if (manualExtract && manualExtract.amount && manualExtract.recipient && !manualExtract.needsContext) {
-        console.log(`[AI Agent] Using fast manual extraction (no AI call)`)
         const amount = manualExtract.amount
         const recipient = manualExtract.recipient
         const memo = manualExtract.memo
@@ -1215,11 +1211,9 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
         const tokenSymbol = manualExtract.tokenSymbol || contextToken || 'USDC'
         
         // ✅ VALIDATE USERNAME EXISTS BEFORE PROCEEDING
-        console.log(`[AI Agent] Validating recipient username: @${recipient}`)
         const usernameValidation = await this.validateUsernameExists(recipient)
         
         if (!usernameValidation.exists) {
-          console.log(`[AI Agent] ❌ Username @${recipient} not found`)
           let errorMessage = `❌ **Username Not Found**\n\n` +
             `The username @${recipient} is not registered in our system.\n\n`
           
@@ -1239,8 +1233,6 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
             message: errorMessage
           }
         }
-        
-        console.log(`[AI Agent] ✅ Username @${recipient} validated (address: ${usernameValidation.address})`)
         
         // CRITICAL: Store pending action BEFORE returning
         const actionKey = `payment_${userId}_${Date.now()}`
@@ -1262,24 +1254,7 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
         }
         
         this.pendingActions.set(actionKey, pendingActionData)
-        console.log(`[AI Agent] ✅ Stored pending action (fast manual extract): ${actionKey}`)
-        console.log(`[AI Agent]   UserId: ${userId} (type: ${typeof userId})`)
-        console.log(`[AI Agent]   Action: ${pendingActionData.action}`)
-        console.log(`[AI Agent]   Recipient: @${recipient}, Amount: $${amount} ${tokenSymbol}`)
-        console.log(`[AI Agent]   Total pending actions now: ${this.pendingActions.size}`)
-        
-        // Clean up old pending actions (older than 5 minutes)
-        const now = Date.now()
-        let cleanedCount = 0
-        for (const [key, action] of this.pendingActions.entries()) {
-          if (now - action.timestamp > 300000) {
-            this.pendingActions.delete(key)
-            cleanedCount++
-          }
-        }
-        if (cleanedCount > 0) {
-          console.log(`[AI Agent] Cleaned up ${cleanedCount} old pending actions`)
-        }
+        this.cleanupOldPendingActions()
         
         return {
           success: true,
@@ -1367,24 +1342,7 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
         }
         
         this.pendingActions.set(actionKey, pendingActionData)
-        console.log(`[AI Agent] ✅ Stored pending action (early return): ${actionKey}`)
-        console.log(`[AI Agent]   UserId: ${userId} (type: ${typeof userId})`)
-        console.log(`[AI Agent]   Action: ${pendingActionData.action}`)
-        console.log(`[AI Agent]   Recipient: @${recipient}, Amount: $${amount} ${tokenSymbol}`)
-        console.log(`[AI Agent]   Total pending actions now: ${this.pendingActions.size}`)
-        
-        // Clean up old pending actions (older than 5 minutes)
-        const now = Date.now()
-        let cleanedCount = 0
-        for (const [key, action] of this.pendingActions.entries()) {
-          if (now - action.timestamp > 300000) {
-            this.pendingActions.delete(key)
-            cleanedCount++
-          }
-        }
-        if (cleanedCount > 0) {
-          console.log(`[AI Agent] Cleaned up ${cleanedCount} old pending actions`)
-        }
+        this.cleanupOldPendingActions()
         
         return {
           success: true,
@@ -1465,11 +1423,9 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
       
       // ✅ VALIDATE USERNAME EXISTS BEFORE PROCEEDING (AI extraction path)
       if (recipient) {
-        console.log(`[AI Agent] Validating recipient username (AI path): @${recipient}`)
         const usernameValidation = await this.validateUsernameExists(recipient)
         
         if (!usernameValidation.exists) {
-          console.log(`[AI Agent] ❌ Username @${recipient} not found (AI path)`)
           let errorMessage = `❌ **Username Not Found**\n\n` +
             `The username @${recipient} is not registered in our system.\n\n`
           
@@ -1490,7 +1446,6 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
           }
         }
         
-        console.log(`[AI Agent] ✅ Username @${recipient} validated (AI path, address: ${usernameValidation.address})`)
       }
       
       // Store pending action (include chain if specified)
@@ -1509,43 +1464,21 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
       }
       
       this.pendingActions.set(actionKey, pendingActionData)
-      console.log(`[AI Agent] ✅ Stored pending action: ${actionKey}`)
-      console.log(`[AI Agent]   UserId: ${userId} (type: ${typeof userId})`)
-      console.log(`[AI Agent]   Action: ${pendingActionData.action}`)
-      console.log(`[AI Agent]   Recipient: @${recipient}, Amount: $${amount} ${tokenSymbol}`)
-      console.log(`[AI Agent]   Total pending actions now: ${this.pendingActions.size}`)
-      
-      // Clean up old pending actions (older than 5 minutes)
-      const now = Date.now()
-      let cleanedCount = 0
-      for (const [key, action] of this.pendingActions.entries()) {
-        if (now - action.timestamp > 300000) {
-          this.pendingActions.delete(key)
-          cleanedCount++
-        }
-      }
-      if (cleanedCount > 0) {
-        console.log(`[AI Agent] Cleaned up ${cleanedCount} old pending actions`)
-      }
+      this.cleanupOldPendingActions()
       
       // Format chain info for display
       let chainInfo = ''
-      if (targetChain) {
+      if (targetChain || sourceChain) {
         const { getChainConfig } = await import('./chainDetector.js')
-        const chainConfig = getChainConfig(targetChain)
-        if (chainConfig) {
-          chainInfo = `\nTarget Chain: ${chainConfig.name}\n`
+        if (targetChain) {
+          const chainConfig = getChainConfig(targetChain)
+          if (chainConfig) chainInfo = `\nTarget Chain: ${chainConfig.name}\n`
         }
-      }
-      if (sourceChain) {
-        const { getChainConfig } = await import('./chainDetector.js')
-        const sourceChainConfig = getChainConfig(sourceChain)
-        if (sourceChainConfig) {
-          chainInfo += `Source Chain: ${sourceChainConfig.name}\n`
+        if (sourceChain) {
+          const sourceChainConfig = getChainConfig(sourceChain)
+          if (sourceChainConfig) chainInfo += `Source Chain: ${sourceChainConfig.name}\n`
         }
-      }
-      if (bridgeNeeded) {
-        chainInfo += `🌉 Bridge Required\n`
+        if (bridgeNeeded) chainInfo += `🌉 Bridge Required\n`
       }
 
         return {
@@ -2632,16 +2565,9 @@ Return ONLY valid JSON, no other text.`
     try {
       // Extract search query from message
       let searchQuery = message
-      
-      // Remove common search keywords AND prediction keywords (users might say "predict Lakers" but we just search)
-      const keywords = ['search', 'markets', 'for', 'show', 'me', 'find', 'look', 'up', 'predict', 'prediction', 'who will win', 'game', 'match']
-      keywords.forEach(keyword => {
-        const regex = new RegExp(`\\b${keyword}\\b`, 'gi')
-        searchQuery = searchQuery.replace(regex, '').trim()
-      })
-      
-      // Clean up extra spaces
-      searchQuery = searchQuery.replace(/\s+/g, ' ').trim()
+        .replace(/\b(search|markets|for|show|me|find|look|up|predict|prediction|who will win|game|match)\b/gi, '')
+        .replace(/\s+/g, ' ')
+        .trim()
       
       if (!searchQuery || searchQuery.length < 2) {
         // If no specific query, show sports markets
@@ -2652,25 +2578,14 @@ Return ONLY valid JSON, no other text.`
       const cacheKey = `markets_${searchQuery.toLowerCase()}`
       const cached = this.getCached(cacheKey, 'markets')
       if (cached) {
-        console.log(`[AI Agent] Using cached markets for: ${searchQuery}`)
-        // Add betting instructions to cached results too
-        const bettingInstructions = `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
-          `💡 **Ready to place a bet?**\n\n` +
-          `Just tell me:\n` +
-          `• "bet $10 YES on [market name]"\n` +
-          `• "bet $50 NO on [market name]"\n` +
-          `• "place $25 YES bet on [market name]"\n\n` +
-          `I'll help you buy shares of YES or NO on any market! 🎯`
-
         return {
           success: true,
-          message: cached.message + bettingInstructions,
+          message: cached.message + this.getBettingInstructions(),
           data: { markets: cached.markets },
           hasCloseButton: true
         }
       }
       
-      console.log(`[AI Agent] Searching markets: ${searchQuery}`)
       const markets = await searchMarkets(searchQuery, 10)
       
       if (markets.length === 0) {
@@ -2687,19 +2602,10 @@ Return ONLY valid JSON, no other text.`
         message: formatted,
         markets
       }, 'markets')
-      
-      // Add betting instructions
-      const bettingInstructions = `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
-        `💡 **Ready to place a bet?**\n\n` +
-        `Just tell me:\n` +
-        `• "bet $10 YES on [market name]"\n` +
-        `• "bet $50 NO on [market name]"\n` +
-        `• "place $25 YES bet on [market name]"\n\n` +
-        `I'll help you buy shares of YES or NO on any market! 🎯`
 
       return {
         success: true,
-        message: formatted + bettingInstructions,
+        message: formatted + this.getBettingInstructions(),
         data: { markets },
         hasCloseButton: true
       }
@@ -2721,25 +2627,14 @@ Return ONLY valid JSON, no other text.`
       const cacheKey = 'sports_markets'
       const cached = this.getCached(cacheKey, 'markets')
       if (cached) {
-        console.log('[AI Agent] Using cached sports markets')
-        // Add betting instructions to cached results too
-        const bettingInstructions = `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
-          `💡 **Ready to place a bet?**\n\n` +
-          `Just tell me:\n` +
-          `• "bet $10 YES on [market name]"\n` +
-          `• "bet $50 NO on [market name]"\n` +
-          `• "place $25 YES bet on [market name]"\n\n` +
-          `I'll help you buy shares of YES or NO on any market! 🎯`
-
         return {
           success: true,
-          message: `🏀 **Sports Prediction Markets**\n\n${cached.message}${bettingInstructions}`,
+          message: `🏀 **Sports Prediction Markets**\n\n${cached.message}${this.getBettingInstructions()}`,
           data: { markets: cached.markets },
           hasCloseButton: true
         }
       }
       
-      console.log('[AI Agent] Fetching sports markets')
       const markets = await getSportsMarkets(10)
       
       if (markets.length === 0) {
@@ -2756,19 +2651,10 @@ Return ONLY valid JSON, no other text.`
         message: formatted,
         markets
       }, 'markets')
-      
-      // Add betting instructions
-      const bettingInstructions = `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
-        `💡 **Ready to place a bet?**\n\n` +
-        `Just tell me:\n` +
-        `• "bet $10 YES on [market name]"\n` +
-        `• "bet $50 NO on [market name]"\n` +
-        `• "place $25 YES bet on [market name]"\n\n` +
-        `I'll help you buy shares of YES or NO on any market! 🎯`
 
       return {
         success: true,
-        message: `🏀 **Sports Prediction Markets**\n\n${formatted}${bettingInstructions}`,
+        message: `🏀 **Sports Prediction Markets**\n\n${formatted}${this.getBettingInstructions()}`,
         data: { markets },
         hasCloseButton: true
       }
@@ -2811,7 +2697,6 @@ Return ONLY valid JSON, no other text.`
       }
 
       // Search for the market
-      console.log(`[AI Agent] Searching for market: ${marketQuery}`)
       const markets = await searchMarkets(marketQuery, 5)
 
       if (markets.length === 0) {
@@ -2826,7 +2711,6 @@ Return ONLY valid JSON, no other text.`
       const marketId = selectedMarket.id || selectedMarket.conditionId
 
       // Prepare the bet
-      console.log(`[AI Agent] Preparing bet: ${side} $${amount} on market ${marketId}`)
       const betResult = await prepareBet(marketId, side, parseFloat(amount))
 
       if (!betResult.success) {
@@ -2852,7 +2736,6 @@ Return ONLY valid JSON, no other text.`
       }
 
       this.pendingActions.set(actionKey, pendingBetData)
-      console.log(`[AI Agent] ✅ Stored pending bet: ${actionKey}`)
 
       // Format confirmation message
       const confirmationMessage = formatBetConfirmation({
@@ -3363,9 +3246,8 @@ If no bet intent found, return {"hasBetIntent": false}.`
         `• "exchange 200 USDC for ETH"\n\n` +
         `*we use uniswap v3 for the best rates. your money, optimized.* 📈\n\n` +
         `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
-        `🎮 **game predictions & betting (polymarket integration)**\n\n` +
+        `🎮 **prediction markets & betting (polymarket integration)**\n\n` +
         `okay this is where it gets fun. we're integrated with polymarket, so you can:\n\n` +
-        `• get ai-powered predictions: "predict lakers vs warriors"\n` +
         `• search markets: "search markets for nba"\n` +
         `• view sports markets: "show sports markets"\n` +
         `• place bets: "bet $10 YES on russia ukraine ceasefire"\n` +
@@ -3411,7 +3293,7 @@ If no bet intent found, return {"hasBetIntent": false}.`
         `**ready to get started?** just ask me anything:\n` +
         `• "send $10 to @friend"\n` +
         `• "what's my balance?"\n` +
-        `• "predict lakers game"\n` +
+        `• "search markets for nba"\n` +
         `• "bridge to polygon"\n\n` +
         `*let's make crypto actually usable. no cap.* 🚀✨\n\n` +
         `*p.s. - i'm always learning. if something doesn't work, just tell me and i'll figure it out.* 🧠`,
@@ -3460,12 +3342,10 @@ If no bet intent found, return {"hasBetIntent": false}.`
         `🔐 **Security**\n` +
         `• "Export my private key"\n` +
         `• "Show my private key"\n\n` +
-        `🎯 **Game Predictions**\n` +
-        `• "Predict Lakers vs Warriors"\n` +
-        `• "Who will win the Super Bowl"\n` +
-        `• "Game prediction for Lakers"\n` +
+        `🎯 **Prediction Markets**\n` +
         `• "Search markets for NBA"\n` +
-        `• "Show sports markets"\n\n` +
+        `• "Show sports markets"\n` +
+        `• "What markets are available"\n\n` +
         `💰 **Place Bets**\n` +
         `• "Bet $10 YES on Russia Ukraine ceasefire"\n` +
         `• "Place NO bet on Lakers for $50"\n` +
@@ -3534,7 +3414,6 @@ If no bet intent found, return {"hasBetIntent": false}.`
     
     if (polymarketKeywords.some(keyword => lowerMessage.includes(keyword))) {
       // Route to market search/view
-      console.log('[AI Agent] Detected Polymarket query in general chat, routing to market search')
       return await this.executeSearchMarkets(message)
     }
 
@@ -3659,29 +3538,6 @@ Remember: Be honest about limitations. Don't make up prices or real-time data.`
     // Normalize userId for comparison (handle both number and string)
     const normalizedUserId = typeof userId === 'number' ? userId : Number(userId)
     
-    console.log(`[AI Agent] ========== CONFIRMATION REQUEST ==========`)
-    console.log(`[AI Agent] Looking for pending action for userId: ${normalizedUserId} (type: ${typeof normalizedUserId})`)
-    console.log(`[AI Agent] Input userId: ${userId} (type: ${typeof userId})`)
-    console.log(`[AI Agent] Total pending actions: ${this.pendingActions.size}`)
-    
-    // Log ALL pending actions for debugging
-    if (this.pendingActions.size > 0) {
-      console.log(`[AI Agent] All pending actions:`)
-      for (const [key, action] of this.pendingActions.entries()) {
-        const actionUserId = typeof action.userId === 'number' ? action.userId : Number(action.userId)
-        const age = Date.now() - action.timestamp
-        const isMatch = actionUserId === normalizedUserId
-        const isExpired = age >= 300000
-        console.log(`[AI Agent]   - Key: ${key}`)
-        console.log(`[AI Agent]     UserId: ${actionUserId} (type: ${typeof actionUserId})`)
-        console.log(`[AI Agent]     Action: ${action.action}`)
-        console.log(`[AI Agent]     Age: ${age}ms (${isExpired ? 'EXPIRED' : 'valid'})`)
-        console.log(`[AI Agent]     Match: ${isMatch ? '✅' : '❌'} (userId match: ${isMatch}, not expired: ${!isExpired})`)
-      }
-    } else {
-      console.log(`[AI Agent] ⚠️ No pending actions in map!`)
-    }
-    
     for (const [key, action] of this.pendingActions.entries()) {
       // Compare userIds (both should be numbers)
       const actionUserId = typeof action.userId === 'number' ? action.userId : Number(action.userId)
@@ -3690,14 +3546,11 @@ Remember: Be honest about limitations. Don't make up prices or real-time data.`
       if (actionUserId === normalizedUserId && age < 300000) {
         pendingAction = action
         actionKey = key
-        console.log(`[AI Agent] ✅ Found matching pending action: ${key}`)
         break
       }
     }
     
     if (!pendingAction) {
-      console.log(`[AI Agent] ❌ No pending action found for userId: ${normalizedUserId}`)
-      console.log(`[AI Agent] ==========================================`)
       return {
         success: false,
         message: "I don't have a pending action to confirm. What would you like to do?"
@@ -3991,8 +3844,6 @@ Remember: Be honest about limitations. Don't make up prices or real-time data.`
       
       // Execute action
       const actionResult = await this.executeAction(intent, message, userId, context, bot)
-      
-      console.log(`[AI Agent] Action executed:`, { success: actionResult.success, hasMessage: !!actionResult.message })
       
       // Add assistant response to conversation history
       if (actionResult.message) {
