@@ -36,10 +36,13 @@ BASE_RPC_URL=https://sepolia.base.org
 ```bash
 USDC_ADDRESS=0x...
 USDT_ADDRESS=0x...
+WBTC_ADDRESS=0x...
+DAI_ADDRESS=0x...
 ```
 - **Description**: ERC-20 token addresses on Base Sepolia
 - **Where**: `backend/services/config.js`
 - **Required**: ✅ Yes (for payments to work)
+- **Note**: DAI uses 18 decimals (unlike USDC/USDT which use 6)
 
 #### Thirdweb Configuration
 ```bash
@@ -95,6 +98,37 @@ APP_URL=http://localhost:3000
 - **Default**: `http://localhost:3000`
 - **Required**: ⚠️ Optional (has default)
 
+#### Database Configuration (Supabase/PostgreSQL)
+```bash
+# Option 1: Use Supabase client (recommended)
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_KEY=your-supabase-anon-key
+
+# Option 2: Use direct PostgreSQL connection
+DATABASE_URL=postgresql://postgres:[PASSWORD]@[HOST]:5432/postgres
+
+# If neither is set, system falls back to SQLite
+```
+- **Description**: Supabase PostgreSQL database connection
+- **Where**: `backend/services/databaseSupabase.js`
+- **Required**: ⚠️ Optional (falls back to SQLite if not set)
+- **Note**: Set either `SUPABASE_URL` + `SUPABASE_KEY` OR `DATABASE_URL` to use Supabase
+
+#### Redis Configuration (for Bull Queue)
+```bash
+# Option 1: Use Redis URL
+REDIS_URL=redis://localhost:6379
+
+# Option 2: Use individual settings
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_PASSWORD=your-redis-password  # Optional
+```
+- **Description**: Redis connection for Bull queue (payment scheduling)
+- **Where**: `backend/services/paymentQueue.js`
+- **Required**: ⚠️ Optional (defaults to localhost:6379 if not set)
+- **Note**: Redis is required for the cron + queue payment scheduler. Install Redis locally or use a cloud service.
+
 #### Server Port
 ```bash
 PORT=5000
@@ -112,6 +146,16 @@ SIGNING_SERVICE_URL=https://app.uniswap.org
 - **Where**: `backend/services/config.js`, `backend/bot/handlers.js`
 - **Default**: `https://app.uniswap.org`
 - **Required**: ⚠️ Optional (has default)
+
+#### Polymarket API (The Graph)
+```bash
+THE_GRAPH_API_KEY=your_the_graph_api_key
+```
+- **Description**: API key from The Graph for Polymarket subgraph access
+- **Where**: `backend/services/polymarketService.js`
+- **Default**: Uses free Goldsky subgraph (no key required)
+- **Required**: ⚠️ Optional (works without key, but limited)
+- **Get Key**: https://thegraph.com/studio/apikeys/ (100k queries/month free)
 
 ---
 
@@ -202,6 +246,11 @@ APP_URL=http://localhost:3000
 PORT=5000
 ENTRY_POINT_ADDRESS=0x0000000071727De22E5E9d8BAf0BaAc3cC26537
 SIGNING_SERVICE_URL=https://app.uniswap.org
+
+# ============================================
+# OPTIONAL - Polymarket API (Game Predictions)
+# ============================================
+THE_GRAPH_API_KEY=your_the_graph_api_key  # Optional: Get from https://thegraph.com/studio/apikeys/
 ```
 
 ### Contracts `.env` (in `contracts/` directory)
@@ -231,6 +280,7 @@ BASESCAN_API_KEY=your_basescan_api_key  # For contract verification
 | `backend/server.js` | `TELEGRAM_BOT_TOKEN`, `PORT` |
 | `backend/services/config.js` | `USERNAME_REGISTRY_ADDRESS`, `SEND_CASH_ADDRESS`, `ENTRY_POINT_ADDRESS`, `BASE_RPC_URL`, `USDC_ADDRESS`, `USDT_ADDRESS`, `THIRDWEB_CLIENT_ID`, `THIRDWEB_FACTORY_ADDRESS`, `SPONSOR_GAS`, `APP_URL`, `SIGNING_SERVICE_URL` |
 | `backend/services/thirdwebWallet.js` | `THIRDWEB_CLIENT_ID`, `BASE_RPC_URL`, `RELAYER_PRIVATE_KEY`, `THIRDWEB_FACTORY_ADDRESS`, `SPONSOR_GAS` |
+| `backend/services/polymarketService.js` | `THE_GRAPH_API_KEY` |
 | `backend/bot/handlers.js` | `BASE_RPC_URL`, `APP_URL`, `SIGNING_SERVICE_URL` |
 | `backend/routes/payment.js` | `APP_URL` |
 
@@ -297,6 +347,14 @@ BASESCAN_API_KEY=your_basescan_api_key  # For contract verification
 ### Base Sepolia RPC
 - Public: `https://sepolia.base.org`
 - Or use Alchemy/Infura endpoint
+
+### The Graph API Key (for Polymarket)
+1. Go to [The Graph Studio](https://thegraph.com/studio)
+2. Connect your wallet
+3. Navigate to [API Keys](https://thegraph.com/studio/apikeys/)
+4. Create a new API key
+5. Free tier: 100,000 queries/month
+6. Copy the API key to `.env` as `THE_GRAPH_API_KEY`
 
 ---
 

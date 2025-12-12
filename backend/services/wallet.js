@@ -1,6 +1,6 @@
 import { ethers } from 'ethers'
 import { CONTRACTS, TOKENS } from './config.js'
-import { getSendCash, getTokenContract, getUsernameRegistry, getProvider } from './contracts.js'
+import { getSendCash, getTokenContract, getUsernameRegistry, getProvider, getProviderWithRetry } from './contracts.js'
 
 // Get balance for a token
 export const getTokenBalance = async (address, tokenAddress) => {
@@ -9,7 +9,8 @@ export const getTokenBalance = async (address, tokenAddress) => {
   
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const provider = getProvider()
+      // ✅ CRITICAL FIX: Use getProviderWithRetry for automatic RPC fallback
+      const provider = await getProviderWithRetry()
       const token = new ethers.Contract(
         tokenAddress,
         ['function balanceOf(address) view returns (uint256)', 'function decimals() view returns (uint8)'],
@@ -23,7 +24,7 @@ export const getTokenBalance = async (address, tokenAddress) => {
       console.warn(`[getTokenBalance] Attempt ${attempt}/${maxRetries} failed:`, error.message)
       
       // If it's a connection error, retry after delay
-      if (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT' || error.message.includes('timeout')) {
+      if (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT' || error.message.includes('timeout') || error.message.includes('network')) {
         if (attempt < maxRetries) {
           await new Promise(resolve => setTimeout(resolve, 1000 * attempt)) // Exponential backoff
           continue
@@ -42,13 +43,14 @@ export const getTokenBalance = async (address, tokenAddress) => {
 // Prepare send transaction (returns transaction data for signing)
 export const prepareSendTransaction = async (fromAddress, toUsername, tokenSymbol, amount) => {
   try {
-    const provider = getProvider()
-    const sendCash = getSendCash()
+    // ✅ CRITICAL FIX: Use getProviderWithRetry for automatic RPC fallback
+    const provider = await getProviderWithRetry()
+    const sendCash = await getSendCash()
 
     // Get recipient address from username
     // ✅ FIX: Use usernameToAddress mapping directly instead of getAddress()
     // getAddress() has a bug that returns registry address for non-existent usernames
-    const registry = getUsernameRegistry()
+    const registry = await getUsernameRegistry()
     
     const toAddress = await registry.usernameToAddress(toUsername.toLowerCase())
     if (!toAddress || toAddress === ethers.ZeroAddress) {
@@ -102,7 +104,8 @@ export const prepareSendTransaction = async (fromAddress, toUsername, tokenSymbo
 // Check if user needs to approve token first
 export const checkTokenAllowance = async (ownerAddress, tokenAddress, amount) => {
   try {
-    const provider = getProvider()
+    // ✅ CRITICAL FIX: Use getProviderWithRetry for automatic RPC fallback
+    const provider = await getProviderWithRetry()
     const token = new ethers.Contract(
       tokenAddress,
       ['function allowance(address, address) view returns (uint256)'],
@@ -120,7 +123,8 @@ export const checkTokenAllowance = async (ownerAddress, tokenAddress, amount) =>
 // Prepare approve transaction
 export const prepareApproveTransaction = async (ownerAddress, tokenAddress) => {
   try {
-    const provider = getProvider()
+    // ✅ CRITICAL FIX: Use getProviderWithRetry for automatic RPC fallback
+    const provider = await getProviderWithRetry()
     const token = new ethers.Contract(
       tokenAddress,
       ['function approve(address, uint256)'],

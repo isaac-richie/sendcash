@@ -52,8 +52,9 @@ const getProviderWithRetry = async () => {
 
 // Initialize provider on first use
 
-export const getSendCash = () => {
-  const currentProvider = getProvider()
+export const getSendCash = async () => {
+  // ✅ CRITICAL FIX: Use getProviderWithRetry for automatic RPC fallback
+  const currentProvider = await getProviderWithRetry()
   return new ethers.Contract(
     CONTRACTS.SEND_CASH,
     [
@@ -80,8 +81,9 @@ export const getSendCash = () => {
   )
 }
 
-export const getUsernameRegistry = () => {
-  const currentProvider = getProvider()
+export const getUsernameRegistry = async () => {
+  // ✅ CRITICAL FIX: Use getProviderWithRetry for automatic RPC fallback
+  const currentProvider = await getProviderWithRetry()
   return new ethers.Contract(
     CONTRACTS.USERNAME_REGISTRY,
     [
@@ -115,8 +117,9 @@ export const getUsernameRegistry = () => {
   )
 }
 
-export const getTokenContract = (tokenAddress) => {
-  const currentProvider = getProvider()
+export const getTokenContract = async (tokenAddress) => {
+  // ✅ CRITICAL FIX: Use getProviderWithRetry for automatic RPC fallback
+  const currentProvider = await getProviderWithRetry()
   return new ethers.Contract(
     tokenAddress,
     [

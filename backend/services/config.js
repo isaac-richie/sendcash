@@ -38,6 +38,12 @@ export const TOKENS = {
     symbol: 'WBTC',
     decimals: 8,
     name: 'Wrapped Bitcoin'
+  },
+  DAI: {
+    address: process.env.DAI_ADDRESS || '',
+    symbol: 'DAI',
+    decimals: 18,
+    name: 'Dai Stablecoin'
   }
 }
 

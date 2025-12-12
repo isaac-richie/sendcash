@@ -2,7 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -37,9 +37,21 @@ contract UsernameRegistryV2 is Ownable, ReentrancyGuard {
     uint256 public premiumFee; // 0 USDC = free (test phase)
 
     // Events
-    event UsernameRegistered(address indexed user, string username, bool isPremium);
-    event UsernameUpdated(address indexed user, string oldUsername, string newUsername);
-    event UsernameTransferred(address indexed from, address indexed to, string username);
+    event UsernameRegistered(
+        address indexed user,
+        string username,
+        bool isPremium
+    );
+    event UsernameUpdated(
+        address indexed user,
+        string oldUsername,
+        string newUsername
+    );
+    event UsernameTransferred(
+        address indexed from,
+        address indexed to,
+        string username
+    );
     event PremiumUsernameRegistered(address indexed user, string username);
     event RegistrationFeeUpdated(uint256 oldFee, uint256 newFee);
     event PremiumFeeUpdated(uint256 oldFee, uint256 newFee);
@@ -57,7 +69,9 @@ contract UsernameRegistryV2 is Ownable, ReentrancyGuard {
     /**
      * @dev Normalize username to lowercase for case‑insensitive mapping.
      */
-    function _normalize(string memory username) internal pure returns (string memory) {
+    function _normalize(
+        string memory username
+    ) internal pure returns (string memory) {
         bytes memory b = bytes(username);
         for (uint256 i = 0; i < b.length; i++) {
             bytes1 char = b[i];
@@ -74,7 +88,10 @@ contract UsernameRegistryV2 is Ownable, ReentrancyGuard {
         require(bytes(username).length <= 32, "Username too long");
         require(isValidUsername(username), "Invalid username format");
         string memory normalized = _normalize(username);
-        require(usernameToAddress[normalized] == address(0), "Username already taken");
+        require(
+            usernameToAddress[normalized] == address(0),
+            "Username already taken"
+        );
     }
 
     // ========= Public API =========
@@ -87,11 +104,18 @@ contract UsernameRegistryV2 is Ownable, ReentrancyGuard {
         _validateNewUsername(username);
 
         string memory normalized = _normalize(username);
-        require(bytes(addressToUsername[msg.sender]).length == 0, "Address already has username");
+        require(
+            bytes(addressToUsername[msg.sender]).length == 0,
+            "Address already has username"
+        );
 
         // Collect registration fee (if any)
         if (registrationFee > 0) {
-            usdcToken.safeTransferFrom(msg.sender, address(this), registrationFee);
+            usdcToken.safeTransferFrom(
+                msg.sender,
+                address(this),
+                registrationFee
+            );
         }
 
         usernameToAddress[normalized] = msg.sender;
@@ -111,14 +135,21 @@ contract UsernameRegistryV2 is Ownable, ReentrancyGuard {
     ) external nonReentrant {
         _validateNewUsername(username);
         require(walletAddress != address(0), "Invalid wallet address");
-        require(bytes(addressToUsername[walletAddress]).length == 0, "Address already has username");
+        require(
+            bytes(addressToUsername[walletAddress]).length == 0,
+            "Address already has username"
+        );
 
         string memory normalized = _normalize(username);
 
         // Collect registration fee from feePayer (if any)
         if (registrationFee > 0) {
             require(feePayer != address(0), "Invalid fee payer");
-            usdcToken.safeTransferFrom(feePayer, address(this), registrationFee);
+            usdcToken.safeTransferFrom(
+                feePayer,
+                address(this),
+                registrationFee
+            );
         }
 
         usernameToAddress[normalized] = walletAddress;
@@ -130,9 +161,14 @@ contract UsernameRegistryV2 is Ownable, ReentrancyGuard {
     /**
      * @dev Register a premium username (custom handle).
      */
-    function registerPremiumUsername(string memory username) external nonReentrant {
+    function registerPremiumUsername(
+        string memory username
+    ) external nonReentrant {
         _validateNewUsername(username);
-        require(bytes(addressToUsername[msg.sender]).length == 0, "Address already has username");
+        require(
+            bytes(addressToUsername[msg.sender]).length == 0,
+            "Address already has username"
+        );
 
         string memory normalized = _normalize(username);
 
@@ -155,7 +191,10 @@ contract UsernameRegistryV2 is Ownable, ReentrancyGuard {
     function updateUsername(string memory newUsername) external nonReentrant {
         string memory oldUsername = addressToUsername[msg.sender];
         require(bytes(oldUsername).length > 0, "No username to update");
-        require(!premiumUsernames[oldUsername], "Cannot update premium username");
+        require(
+            !premiumUsernames[oldUsername],
+            "Cannot update premium username"
+        );
 
         _validateNewUsername(newUsername);
         string memory normalizedNew = _normalize(newUsername);
@@ -176,7 +215,10 @@ contract UsernameRegistryV2 is Ownable, ReentrancyGuard {
      */
     function transferUsername(address to) external nonReentrant {
         require(to != address(0), "Invalid recipient");
-        require(bytes(addressToUsername[to]).length == 0, "Recipient already has username");
+        require(
+            bytes(addressToUsername[to]).length == 0,
+            "Recipient already has username"
+        );
 
         string memory username = addressToUsername[msg.sender];
         require(bytes(username).length > 0, "No username to transfer");
@@ -197,30 +239,36 @@ contract UsernameRegistryV2 is Ownable, ReentrancyGuard {
      *      ✅ FIX: Explicitly ensure we never return the contract's own address,
      *      which would indicate a bug. Always return address(0) for non-existent usernames.
      */
-    function getAddress(string memory username) external view returns (address) {
+    function getAddress(
+        string memory username
+    ) external view returns (address) {
         string memory normalized = _normalize(username);
         address result = usernameToAddress[normalized];
-        
+
         // ✅ SAFEGUARD: Never return the contract's own address (indicates a bug)
         // If mapping somehow returns this contract's address, treat it as non-existent
         if (result == address(this)) {
             return address(0);
         }
-        
+
         return result;
     }
 
     /**
      * @dev Get username for an address (already stored normalized).
      */
-    function getUsername(address userAddress) external view returns (string memory) {
+    function getUsername(
+        address userAddress
+    ) external view returns (string memory) {
         return addressToUsername[userAddress];
     }
 
     /**
      * @dev Check if username is valid (alphanumeric and underscores only).
      */
-    function isValidUsername(string memory username) public pure returns (bool) {
+    function isValidUsername(
+        string memory username
+    ) public pure returns (bool) {
         bytes memory b = bytes(username);
         if (b.length == 0) return false;
 
@@ -241,7 +289,9 @@ contract UsernameRegistryV2 is Ownable, ReentrancyGuard {
     /**
      * @dev Check if username is available (case‑insensitive).
      */
-    function isUsernameAvailable(string memory username) external view returns (bool) {
+    function isUsernameAvailable(
+        string memory username
+    ) external view returns (bool) {
         string memory normalized = _normalize(username);
         return usernameToAddress[normalized] == address(0);
     }
@@ -280,6 +330,3 @@ contract UsernameRegistryV2 is Ownable, ReentrancyGuard {
         return usdcToken.balanceOf(address(this));
     }
 }
-
-
-

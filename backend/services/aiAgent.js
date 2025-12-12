@@ -1,12 +1,16 @@
 import { ethers } from 'ethers'
 import { BASE_RPC, CONTRACTS, TOKENS } from './config.js'
-import { dbGet, dbAll, dbRun } from './database.js'
+import { dbGet, dbAll, dbRun } from './databaseSupabase.js'
 import { getTokenBalance } from './wallet.js'
+import { getProviderWithRetry } from './contracts.js'
 import OpenAI from 'openai'
 import dotenv from 'dotenv'
 import { getUserFriendlyError } from './errorMessages.js'
 import { executePayment, executeRegisterUsername, executeSchedulePayment, executeViewScheduledPayments, executeCancelScheduledPayment } from './aiActions.js'
 import { getPaymentStatistics, generateTransactionReport, formatStatisticsMessage, formatReportMessage, generateReportInsights } from './analytics.js'
+import { searchMarkets, getSportsMarkets, formatMarketsList, prepareBet, getMarketWithTokens, formatBetConfirmation, executeBet, getUserBets, formatUserBets, formatMarket } from './polymarketService.js'
+import { exportPrivateKey } from './thirdwebWallet.js'
+import { executeBridge, getChainBalance, checkBridgeNeeded, CHAINS } from './bridgeService.js'
 
 dotenv.config()
 
@@ -34,13 +38,17 @@ class SendCashAI {
       balances: new Map(), // wallet address -> { data, timestamp }
       analysis: new Map(), // wallet address -> { data, timestamp }
       intents: new Map(), // message hash -> { intent, timestamp }
-      paymentIntents: new Map() // message hash -> { intent, timestamp }
+      paymentIntents: new Map(), // message hash -> { intent, timestamp }
+      markets: new Map(), // search query -> { data, timestamp }
+      predictions: new Map() // search query -> { data, timestamp }
     }
     this.cacheTTL = {
       balances: 60000, // 60 seconds (increased for better cache hit rate)
       analysis: 120000, // 2 minutes (increased)
       intents: 600000, // 10 minutes (increased)
-      paymentIntents: 600000 // 10 minutes (increased)
+      paymentIntents: 600000, // 10 minutes (increased)
+      markets: 300000, // 5 minutes (markets don't change too frequently)
+      predictions: 300000 // 5 minutes (predictions update periodically)
     }
     
     // Request queue for OpenAI API (rate limiting)
@@ -230,6 +238,7 @@ class SendCashAI {
     // Get contract instances
     this.sendCashContract = await this.getSendCashContract()
     this.usernameRegistry = await this.getUsernameRegistry()
+    // Note: sendCashContract is the same as sendCash, no need to duplicate
     
     this.initialized = true
     console.log('[AI Agent] Initialized and ready')
@@ -633,6 +642,11 @@ Classify the user's message into one of these intents:
 
 PAYMENT INTENTS:
 - send_payment: Immediate payment (e.g., "send $10 to @alice", "pay bob 50 USDC")
+  * Multi-chain payments: "send @jamiu 10 USDC on BNB chain", "pay bob 50 USDT on polygon", "send 100 USDC to alice on arbitrum"
+  * Bridge and pay: "Send 25 USDC to my friend on Base. My funds are on Polygon.", "Pay 10 USDC on Arbitrum using my Optimism balance"
+  * Cheapest route: "Use the cheapest route to move 20 USDC from Arbitrum to Avalanche"
+  * Any chain: "Bridge from any chain that has enough balance"
+  * Supported chains: BSC (BNB Chain), Polygon, Arbitrum, Optimism, Ethereum, Avalanche, Base, zkSync Era, Linea, Scroll, Mantle, Blast
 - schedule_payment: Scheduled payment for future (look for keywords like):
   * "schedule", "in X minutes", "in X hours", "in X days"
   * "tomorrow", "next week", "on [date]", "at [time]"
@@ -673,6 +687,21 @@ USERNAME INTENTS:
 
 SECURITY:
 - export_key: Export private key (e.g., "export my key", "show private key", "export key")
+
+MARKET INTENTS:
+- search_markets: Search prediction markets (e.g., "search markets for NBA", "show me prediction markets", "what markets are available", "show me polymarket", "what's on polymarket", "polymarket markets", "show polymarket", "polymarket", "Lakers markets", "markets for Lakers", "find markets about election")
+- view_sports_markets: View sports prediction markets (e.g., "show sports markets", "what sports predictions are available", "sports markets")
+
+BETTING INTENTS:
+- place_bet: Place a YES or NO bet on a Polymarket market (e.g., "bet YES on Russia Ukraine ceasefire", "place NO bet on Lakers", "I want to bet $10 YES on market X")
+- view_bets: View user's active bets/positions (e.g., "show my bets", "what bets do I have", "my positions")
+
+BRIDGE INTENTS:
+- bridge_funds: Bridge funds between chains (e.g., "bridge $10 USDC to Polygon", "move funds to Polygon", "bridge to Polygon", "send $50 to Polygon", "bridge 10 USDC from Arbitrum to Base", "bridge from Polygon to Optimism")
+- check_balance_cross_chain: Check balance across chains (e.g., "my balance on Polygon", "check Polygon balance", "balance on Base")
+
+EDUCATION INTENTS:
+- education: Explain what SendCash can do, features, how it works (e.g., "what can you do", "tell me about sendcash", "what is this", "how does this work", "what are you", "explain sendcash", "show me what you can do", "what features do you have")
 
 HELP:
 - help: Need help or want to know what bot can do (e.g., "help", "what can you do", "how does this work")
@@ -752,11 +781,34 @@ Example: {"intent": "schedule_payment", "confidence": 0.95}`
 Extract payment details from the user's message. Return a JSON object with:
 - hasPaymentIntent: boolean
 - amount: number (if found)
-- recipient: string (username without @)
-- token: string (USDC, USDT, WBTC - ONLY return a token if explicitly mentioned in the message, otherwise return null)
+- recipient: string (username without @, or wallet address if provided)
+- token: string (USDC, USDT, WBTC, DAI - ONLY return a token if explicitly mentioned in the message, otherwise return null)
+- chain: string (target blockchain chain if specified, e.g., "BSC", "POLYGON", "ARBITRUM", "OPTIMISM", "ETHEREUM", "AVALANCHE", "BASE", "ZKSYNC_ERA", "LINEA", "SCROLL", "MANTLE", "BLAST" - return null if not specified)
+- sourceChain: string (source chain where funds currently are, if explicitly mentioned - e.g., "POLYGON", "ARBITRUM", "OPTIMISM", "ETHEREUM", "BSC" - return null if not specified)
+- bridgeNeeded: boolean (true if user explicitly mentions bridging or funds are on different chain than target)
+- cheapestRoute: boolean (true if user asks for "cheapest route" or "best route")
+- useAnyChain: boolean (true if user says "any chain", "any chain with balance", "from any chain")
 - memo: string (optional note/purpose for the payment)
 - scheduledDate: string (ISO 8601 date string if payment is scheduled for future, null for immediate payments)
 - isScheduled: boolean (true if payment should be scheduled, false for immediate)
+
+CHAIN DETECTION:
+- Look for chain mentions like "on BNB chain", "on Polygon", "to Arbitrum", "on BSC", etc.
+- Common chain names: "bnb" or "bnb chain" → BSC, "polygon" → POLYGON, "arbitrum" or "arb" → ARBITRUM, "optimism" or "op" → OPTIMISM, "ethereum" or "eth" → ETHEREUM, "avalanche" or "avax" → AVALANCHE
+- If no chain is mentioned, return null for chain field
+
+BRIDGE DETECTION:
+- If user says "my funds are on X" or "use funds from X" or "bridge from X" → set sourceChain to X
+- If user says "send to Y" or "pay on Y" and sourceChain is different → set bridgeNeeded: true
+- If user explicitly says "bridge" → set bridgeNeeded: true
+- If user says "cheapest route" or "best route" → set cheapestRoute: true
+- If user says "any chain" or "from any chain with balance" → set useAnyChain: true
+- Examples:
+  * "Send 25 USDC to my friend on Base. My funds are on Polygon." → chain: "BASE", sourceChain: "POLYGON", bridgeNeeded: true
+  * "Pay 10 USDC on Arbitrum, but use the USDC in my Optimism account." → chain: "ARBITRUM", sourceChain: "OPTIMISM", bridgeNeeded: true
+  * "Bridge 40 USDC to Solana" → bridgeNeeded: true, chain: "SOLANA" (note: Solana not supported, but extract anyway)
+  * "Use the cheapest route to move 20 USDC from Arbitrum to Avalanche" → sourceChain: "ARBITRUM", chain: "AVALANCHE", bridgeNeeded: true, cheapestRoute: true
+  * "Bridge from any chain that has enough balance" → useAnyChain: true, bridgeNeeded: true
 
 SCHEDULING DETECTION:
 - If message contains scheduling keywords like "schedule", "in X minutes", "in X hours", "tomorrow", "next week", "on [date]", "at [time]", etc., set isScheduled: true
@@ -776,19 +828,22 @@ IMPORTANT RULES:
 
 EXAMPLES:
 Immediate payment with token: "send $10 USDC to @alice"
-→ {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token": "USDC", "memo": null, "isScheduled": false, "scheduledDate": null}
+→ {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token": "USDC", "chain": null, "sourceChain": null, "bridgeNeeded": false, "cheapestRoute": false, "useAnyChain": false, "memo": null, "isScheduled": false, "scheduledDate": null}
 
-Immediate payment without token: "send $10 to @alice"
-→ {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token": null, "memo": null, "isScheduled": false, "scheduledDate": null}
+Payment with chain: "send @jamiu 10 USDC on BNB chain"
+→ {"hasPaymentIntent": true, "amount": 10, "recipient": "jamiu", "token": "USDC", "chain": "BSC", "sourceChain": null, "bridgeNeeded": false, "cheapestRoute": false, "useAnyChain": false, "memo": null, "isScheduled": false, "scheduledDate": null}
 
-Scheduled with token: "send $10 USDT to @alice in 2 minutes"
-→ {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token": "USDT", "memo": null, "isScheduled": true, "scheduledDate": "2024-11-29T04:12:00Z"}
+Bridge and pay: "Send 25 USDC to my friend on Base. My funds are on Polygon."
+→ {"hasPaymentIntent": true, "amount": 25, "recipient": "friend", "token": "USDC", "chain": "BASE", "sourceChain": "POLYGON", "bridgeNeeded": true, "cheapestRoute": false, "useAnyChain": false, "memo": null, "isScheduled": false, "scheduledDate": null}
 
-Scheduled without token: "send $10 to @alice in 2 minutes"
-→ {"hasPaymentIntent": true, "amount": 10, "recipient": "alice", "token": null, "memo": null, "isScheduled": true, "scheduledDate": "2024-11-29T04:12:00Z"}
+Bridge from specific chain: "Pay this wallet 10 USDC on Arbitrum, but use the USDC in my Optimism account."
+→ {"hasPaymentIntent": true, "amount": 10, "recipient": "wallet", "token": "USDC", "chain": "ARBITRUM", "sourceChain": "OPTIMISM", "bridgeNeeded": true, "cheapestRoute": false, "useAnyChain": false, "memo": null, "isScheduled": false, "scheduledDate": null}
 
-Scheduled - absolute: "schedule $50 USDC to @bob for tomorrow at 3pm"
-→ {"hasPaymentIntent": true, "amount": 50, "recipient": "bob", "token": "USDC", "memo": null, "isScheduled": true, "scheduledDate": "2024-11-30T15:00:00Z"}
+Cheapest route: "Use the cheapest route to move 20 USDC from Arbitrum to Avalanche and pay this invoice."
+→ {"hasPaymentIntent": true, "amount": 20, "recipient": "invoice", "token": "USDC", "chain": "AVALANCHE", "sourceChain": "ARBITRUM", "bridgeNeeded": true, "cheapestRoute": true, "useAnyChain": false, "memo": null, "isScheduled": false, "scheduledDate": null}
+
+Any chain: "Bridge from any chain that has enough balance"
+→ {"hasPaymentIntent": true, "amount": null, "recipient": null, "token": null, "chain": null, "sourceChain": null, "bridgeNeeded": true, "cheapestRoute": false, "useAnyChain": true, "memo": null, "isScheduled": false, "scheduledDate": null}
 
 If no payment intent found, return {"hasPaymentIntent": false}.`
 
@@ -821,6 +876,36 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
       } catch (e) {
         // Fallback parsing
         result = { hasPaymentIntent: false }
+      }
+      
+      // Fallback: Try to detect chain from message if AI didn't extract it
+      if (result.hasPaymentIntent) {
+        const { parseChainFromMessage, parseSourceChainFromMessage } = await import('./chainDetector.js')
+        
+        // Detect target chain
+        if (!result.chain) {
+          const detectedChain = parseChainFromMessage(message, true)
+          if (detectedChain) {
+            result.chain = detectedChain.key
+          }
+        }
+        
+        // Detect source chain
+        if (!result.sourceChain) {
+          const detectedSourceChain = parseSourceChainFromMessage(message)
+          if (detectedSourceChain) {
+            result.sourceChain = detectedSourceChain.key
+            // If source chain differs from target, bridge is needed
+            if (result.chain && result.sourceChain !== result.chain) {
+              result.bridgeNeeded = true
+            }
+          }
+        }
+        
+        // Auto-detect bridge needed if source and target chains differ
+        if (result.chain && result.sourceChain && result.sourceChain !== result.chain) {
+          result.bridgeNeeded = true
+        }
       }
       
       // Cache the result
@@ -875,6 +960,7 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
     let tokenSymbol = 'USDC'
     if (lowerMessage.includes('usdt')) tokenSymbol = 'USDT'
     else if (lowerMessage.includes('wbtc')) tokenSymbol = 'WBTC'
+    else if (lowerMessage.includes('dai')) tokenSymbol = 'DAI'
     
     // Extract memo
     const memoPatterns = [
@@ -963,6 +1049,27 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
       case 'cancel_scheduled_payment':
         return await this.executeCancelScheduledPayment(message, userId, bot)
       
+      case 'search_markets':
+        return await this.executeSearchMarkets(message)
+      
+      case 'view_sports_markets':
+        return await this.executeViewSportsMarkets()
+      
+      case 'place_bet':
+        return await this.executePlaceBet(message, userId, context, bot)
+      
+      case 'view_bets':
+        return await this.executeViewBets(userId)
+      
+      case 'bridge_funds':
+        return await this.executeBridgeFunds(message, userId, context, bot)
+      
+      case 'check_balance_cross_chain':
+        return await this.executeCheckCrossChainBalance(message, userId, context)
+      
+      case 'education':
+        return await this.executeEducation()
+      
       case 'help':
         return await this.executeHelp()
       
@@ -1041,6 +1148,7 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
     try {
       let contextAmount = null
       let contextToken = null
+      let targetChain = null // Declare once at the top
       
       // Proactively search conversation history for amounts
       const history = this.getConversationHistory(userId)
@@ -1068,12 +1176,20 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
         const recipient = manualExtract.recipient
         const memo = manualExtract.memo
         
+        // Extract chain from message (manual extraction)
+        const { parseChainFromMessage } = await import('./chainDetector.js')
+        const detectedChain = parseChainFromMessage(message)
+        if (detectedChain) {
+          targetChain = detectedChain.key
+        }
+        
         // ✅ Check if token was explicitly specified in the message
         const messageLower = message.toLowerCase()
-        const hasTokenSpecified = 
-          messageLower.includes('usdc') || 
-          messageLower.includes('usdt') || 
+        const hasTokenSpecified =
+          messageLower.includes('usdc') ||
+          messageLower.includes('usdt') ||
           messageLower.includes('wbtc') ||
+          messageLower.includes('dai') ||
           messageLower.includes('bitcoin') ||
           messageLower.includes('tether') ||
           contextToken // If token was mentioned in conversation history
@@ -1086,11 +1202,13 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
               `You want to send $${amount} to @${recipient}, but I need to know which token:\n\n` +
               `• **USDC** (USD Coin)\n` +
               `• **USDT** (Tether)\n` +
-              `• **WBTC** (Wrapped Bitcoin)\n\n` +
+              `• **WBTC** (Wrapped Bitcoin)\n` +
+              `• **DAI** (Dai Stablecoin)\n\n` +
               `Please specify, for example:\n` +
               `• "Send $${amount} USDC to @${recipient}"\n` +
               `• "Pay @${recipient} $${amount} USDT"\n` +
-              `• "Send $${amount} WBTC to @${recipient}"`
+              `• "Send $${amount} WBTC to @${recipient}"\n` +
+              `• "Send $${amount} DAI to @${recipient}"`
           }
         }
         
@@ -1133,7 +1251,12 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
             recipient,
             amount: amount.toString(),
             tokenSymbol,
-            memo: memo || null
+            memo: memo || null,
+            chain: targetChain || null,
+            sourceChain: null, // Manual extraction doesn't support source chain yet
+            bridgeNeeded: targetChain ? true : false,
+            cheapestRoute: false,
+            useAnyChain: false
           },
           timestamp: Date.now()
         }
@@ -1172,7 +1295,8 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
             recipient,
             amount: amount.toString(),
             tokenSymbol,
-            memo: memo || null
+            memo: memo || null,
+            chain: targetChain || null
           }
         }
       }
@@ -1186,6 +1310,18 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
       
       // Try AI extraction
       let paymentIntent = await this.extractPaymentIntent(message, userId)
+      
+      // Extract chain from payment intent or message (reuse targetChain variable)
+      if (paymentIntent && paymentIntent.chain) {
+        targetChain = paymentIntent.chain
+      } else if (!targetChain) {
+        // Fallback: try to detect chain from message (only if not already set)
+        const { parseChainFromMessage } = await import('./chainDetector.js')
+        const detectedChain = parseChainFromMessage(message)
+        if (detectedChain) {
+          targetChain = detectedChain.key
+        }
+      }
       
       // If AI extraction found an amount, use it; otherwise use context amount
       if (paymentIntent && paymentIntent.hasPaymentIntent && paymentIntent.amount) {
@@ -1204,6 +1340,13 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
         const tokenSymbol = manualExtract.tokenSymbol || 'USDC'
         const memo = manualExtract.memo
         
+        // Extract chain if mentioned (reuse targetChain variable)
+        const { parseChainFromMessage } = await import('./chainDetector.js')
+        const detectedChain = parseChainFromMessage(message)
+        if (detectedChain) {
+          targetChain = detectedChain.key
+        }
+
         // Store pending action (CRITICAL: must store before returning)
         const actionKey = `payment_${userId}_${Date.now()}`
         const pendingActionData = {
@@ -1213,7 +1356,12 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
             recipient,
             amount: amount.toString(),
             tokenSymbol,
-            memo: memo || null
+            memo: memo || null,
+            chain: targetChain || null,
+            sourceChain: null, // Manual extraction with context doesn't support source chain yet
+            bridgeNeeded: targetChain ? true : false,
+            cheapestRoute: false,
+            useAnyChain: false
           },
           timestamp: Date.now()
         }
@@ -1269,6 +1417,10 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
       const recipient = paymentIntent.recipient
       const token = paymentIntent.token || contextToken
       const memo = paymentIntent.memo || null
+      // Use targetChain from above, or extract from paymentIntent if not already set
+      if (paymentIntent.chain && !targetChain) {
+        targetChain = paymentIntent.chain
+      }
       
       if (!amount || !recipient) {
         const friendlyError = getUserFriendlyError('Missing payment details', 'payment')
@@ -1281,11 +1433,12 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
       // ✅ Check if token was explicitly specified in the message
       // If not, ask user which asset they want to use
       const messageLower = message.toLowerCase()
-      const hasTokenSpecified = 
+      const hasTokenSpecified =
         token && token.toUpperCase() !== 'USDC' || // If token is explicitly set to something other than default
-        messageLower.includes('usdc') || 
-        messageLower.includes('usdt') || 
+        messageLower.includes('usdc') ||
+        messageLower.includes('usdt') ||
         messageLower.includes('wbtc') ||
+        messageLower.includes('dai') ||
         messageLower.includes('bitcoin') ||
         messageLower.includes('tether') ||
         contextToken // If token was mentioned in conversation history
@@ -1298,11 +1451,13 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
             `You want to send $${amount} to @${recipient}, but I need to know which token:\n\n` +
             `• **USDC** (USD Coin)\n` +
             `• **USDT** (Tether)\n` +
-            `• **WBTC** (Wrapped Bitcoin)\n\n` +
+            `• **WBTC** (Wrapped Bitcoin)\n` +
+            `• **DAI** (Dai Stablecoin)\n\n` +
             `Please specify, for example:\n` +
             `• "Send $${amount} USDC to @${recipient}"\n` +
             `• "Pay @${recipient} $${amount} USDT"\n` +
-            `• "Send $${amount} WBTC to @${recipient}"`
+            `• "Send $${amount} WBTC to @${recipient}"\n` +
+            `• "Send $${amount} DAI to @${recipient}"`
         }
       }
 
@@ -1338,7 +1493,7 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
         console.log(`[AI Agent] ✅ Username @${recipient} validated (AI path, address: ${usernameValidation.address})`)
       }
       
-      // Store pending action
+      // Store pending action (include chain if specified)
       const actionKey = `payment_${userId}_${Date.now()}`
       const pendingActionData = {
         userId,
@@ -1347,7 +1502,8 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
           recipient,
           amount: amount.toString(),
           tokenSymbol,
-          memo
+          memo,
+          chain: targetChain || null
         },
         timestamp: Date.now()
       }
@@ -1372,23 +1528,45 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
         console.log(`[AI Agent] Cleaned up ${cleanedCount} old pending actions`)
       }
       
-      return {
-        success: true,
-        needsConfirmation: true,
-        action: 'send_payment',
-        message: `💸 **Payment Details:**\n\n` +
-          `To: @${recipient}\n` +
-          `Amount: $${amount} ${tokenSymbol}\n` +
-          (memo ? `Note: ${memo}\n` : '') +
-          `Fee: 0.5%\n\n` +
-          `Reply "yes" or "confirm" to send, or "cancel" to abort.`,
-        data: {
-          recipient,
-          amount: amount.toString(),
-          tokenSymbol,
-          memo
+      // Format chain info for display
+      let chainInfo = ''
+      if (targetChain) {
+        const { getChainConfig } = await import('./chainDetector.js')
+        const chainConfig = getChainConfig(targetChain)
+        if (chainConfig) {
+          chainInfo = `\nTarget Chain: ${chainConfig.name}\n`
         }
       }
+      if (sourceChain) {
+        const { getChainConfig } = await import('./chainDetector.js')
+        const sourceChainConfig = getChainConfig(sourceChain)
+        if (sourceChainConfig) {
+          chainInfo += `Source Chain: ${sourceChainConfig.name}\n`
+        }
+      }
+      if (bridgeNeeded) {
+        chainInfo += `🌉 Bridge Required\n`
+      }
+
+        return {
+          success: true,
+          needsConfirmation: true,
+          action: 'send_payment',
+          message: `💸 **Payment Details:**\n\n` +
+            `To: @${recipient}\n` +
+            `Amount: $${amount} ${tokenSymbol}\n` +
+            (memo ? `Note: ${memo}\n` : '') +
+            chainInfo +
+            `Fee: 0.5%\n\n` +
+            `Reply "yes" or "confirm" to send, or "cancel" to abort.`,
+          data: {
+            recipient,
+            amount: amount.toString(),
+            tokenSymbol,
+            memo,
+            chain: targetChain || null
+          }
+        }
     } catch (error) {
       console.error('[AI Agent] Error executing send payment:', error)
       const friendlyError = getUserFriendlyError(error, 'payment')
@@ -1433,8 +1611,8 @@ Use this as the reference point for calculating "in X minutes/hours" expressions
         const isSent = tx.from_address?.toLowerCase() === walletAddress.toLowerCase()
         const direction = isSent ? '➡️' : '⬅️'
         const action = isSent ? 'Sent' : 'Received'
-        const counterparty = isSent 
-          ? (tx.to_username ? `@${tx.to_username}` : tx.to_address?.slice(0, 10) + '...') 
+        const counterparty = isSent
+          ? (tx.to_username ? `@${tx.to_username}` : tx.to_address?.slice(0, 10) + '...')
           : (tx.from_username ? `@${tx.from_username}` : tx.from_address?.slice(0, 10) + '...')
         
         // Determine token symbol and decimals
@@ -1851,7 +2029,7 @@ Examples:
 - "swap my USDC to USDT" → {"fromToken": "USDC", "toToken": "USDT", "amount": null, "slippageBps": 100} (amount needs context)
 - "convert USDC to ETH" → {"fromToken": "USDC", "toToken": "ETH", "amount": null, "slippageBps": 100} (amount needs context)
 
-Supported tokens: USDC, USDT, WBTC, ETH, WETH
+Supported tokens: USDC, USDT, WBTC, DAI, ETH, WETH
 
 Return ONLY valid JSON, no other text.`
 
@@ -1908,7 +2086,7 @@ Return ONLY valid JSON, no other text.`
           // Pattern: "swap USDC to USDT" (no amount specified)
           const [, fromToken, toToken] = match
           // Check if this looks like tokens (not common words)
-          const tokenSymbols = ['USDC', 'USDT', 'WBTC', 'ETH', 'WETH']
+          const tokenSymbols = ['USDC', 'USDT', 'WBTC', 'DAI', 'ETH', 'WETH']
           if (tokenSymbols.includes(fromToken.toUpperCase()) && tokenSymbols.includes(toToken.toUpperCase())) {
             return {
               fromToken: fromToken.toUpperCase(),
@@ -2060,10 +2238,10 @@ Return ONLY valid JSON, no other text.`
       // ✅ Check if token was explicitly specified
       // If token is null, undefined, or empty, ask user which asset they want to use
       const messageLower = message.toLowerCase()
-      const hasTokenSpecified = 
+      const hasTokenSpecified =
         token && token !== 'USDC' || // If token is explicitly set to something other than default
-        messageLower.includes('usdc') || 
-        messageLower.includes('usdt') || 
+        messageLower.includes('usdc') ||
+        messageLower.includes('usdt') ||
         messageLower.includes('wbtc') ||
         messageLower.includes('bitcoin') ||
         messageLower.includes('tether')
@@ -2256,9 +2434,9 @@ Return ONLY valid JSON, no other text.`
         const registryAddress = CONTRACTS.USERNAME_REGISTRY.toLowerCase()
         const cachedAddress = cached.address.toLowerCase()
         
-        if (cachedAddress !== registryAddress && 
-            cachedAddress !== ethers.ZeroAddress.toLowerCase() &&
-            ethers.isAddress(cached.address)) {
+        if (cachedAddress !== registryAddress &&
+          cachedAddress !== ethers.ZeroAddress.toLowerCase() &&
+          ethers.isAddress(cached.address)) {
           return {
             exists: true,
             address: cached.address
@@ -2287,10 +2465,10 @@ Return ONLY valid JSON, no other text.`
       const returnedAddress = address ? address.toLowerCase() : null
       
       // Username exists if address is valid, not zero, and not the registry contract itself
-      if (address && 
-          address !== ethers.ZeroAddress && 
-          returnedAddress !== registryAddress &&
-          ethers.isAddress(address)) {
+      if (address &&
+        address !== ethers.ZeroAddress &&
+        returnedAddress !== registryAddress &&
+        ethers.isAddress(address)) {
         // Cache it for future lookups
         try {
           await dbRun(
@@ -2446,14 +2624,810 @@ Return ONLY valid JSON, no other text.`
     }
   }
 
+
+  /**
+   * Execute: Search Markets
+   */
+  async executeSearchMarkets(message) {
+    try {
+      // Extract search query from message
+      let searchQuery = message
+      
+      // Remove common search keywords AND prediction keywords (users might say "predict Lakers" but we just search)
+      const keywords = ['search', 'markets', 'for', 'show', 'me', 'find', 'look', 'up', 'predict', 'prediction', 'who will win', 'game', 'match']
+      keywords.forEach(keyword => {
+        const regex = new RegExp(`\\b${keyword}\\b`, 'gi')
+        searchQuery = searchQuery.replace(regex, '').trim()
+      })
+      
+      // Clean up extra spaces
+      searchQuery = searchQuery.replace(/\s+/g, ' ').trim()
+      
+      if (!searchQuery || searchQuery.length < 2) {
+        // If no specific query, show sports markets
+        return await this.executeViewSportsMarkets()
+      }
+      
+      // Check cache first
+      const cacheKey = `markets_${searchQuery.toLowerCase()}`
+      const cached = this.getCached(cacheKey, 'markets')
+      if (cached) {
+        console.log(`[AI Agent] Using cached markets for: ${searchQuery}`)
+        // Add betting instructions to cached results too
+        const bettingInstructions = `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+          `💡 **Ready to place a bet?**\n\n` +
+          `Just tell me:\n` +
+          `• "bet $10 YES on [market name]"\n` +
+          `• "bet $50 NO on [market name]"\n` +
+          `• "place $25 YES bet on [market name]"\n\n` +
+          `I'll help you buy shares of YES or NO on any market! 🎯`
+
+        return {
+          success: true,
+          message: cached.message + bettingInstructions,
+          data: { markets: cached.markets },
+          hasCloseButton: true
+        }
+      }
+      
+      console.log(`[AI Agent] Searching markets: ${searchQuery}`)
+      const markets = await searchMarkets(searchQuery, 10)
+      
+      if (markets.length === 0) {
+        return {
+          success: false,
+          message: `No prediction markets found for "${searchQuery}". Try a different search term.`
+        }
+      }
+      
+      const formatted = formatMarketsList(markets)
+      
+      // Cache the result
+      this.setCache(cacheKey, {
+        message: formatted,
+        markets
+      }, 'markets')
+      
+      // Add betting instructions
+      const bettingInstructions = `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `💡 **Ready to place a bet?**\n\n` +
+        `Just tell me:\n` +
+        `• "bet $10 YES on [market name]"\n` +
+        `• "bet $50 NO on [market name]"\n` +
+        `• "place $25 YES bet on [market name]"\n\n` +
+        `I'll help you buy shares of YES or NO on any market! 🎯`
+
+      return {
+        success: true,
+        message: formatted + bettingInstructions,
+        data: { markets },
+        hasCloseButton: true
+      }
+    } catch (error) {
+      console.error('[AI Agent] Error searching markets:', error)
+      return {
+        success: false,
+        message: "I encountered an error searching markets. Please try again."
+      }
+    }
+  }
+
+  /**
+   * Execute: View Sports Markets
+   */
+  async executeViewSportsMarkets() {
+    try {
+      // Check cache first
+      const cacheKey = 'sports_markets'
+      const cached = this.getCached(cacheKey, 'markets')
+      if (cached) {
+        console.log('[AI Agent] Using cached sports markets')
+        // Add betting instructions to cached results too
+        const bettingInstructions = `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+          `💡 **Ready to place a bet?**\n\n` +
+          `Just tell me:\n` +
+          `• "bet $10 YES on [market name]"\n` +
+          `• "bet $50 NO on [market name]"\n` +
+          `• "place $25 YES bet on [market name]"\n\n` +
+          `I'll help you buy shares of YES or NO on any market! 🎯`
+
+        return {
+          success: true,
+          message: `🏀 **Sports Prediction Markets**\n\n${cached.message}${bettingInstructions}`,
+          data: { markets: cached.markets },
+          hasCloseButton: true
+        }
+      }
+      
+      console.log('[AI Agent] Fetching sports markets')
+      const markets = await getSportsMarkets(10)
+      
+      if (markets.length === 0) {
+        return {
+          success: false,
+          message: "No sports markets available at the moment. Please try again later."
+        }
+      }
+      
+      const formatted = formatMarketsList(markets)
+      
+      // Cache the result
+      this.setCache(cacheKey, {
+        message: formatted,
+        markets
+      }, 'markets')
+      
+      // Add betting instructions
+      const bettingInstructions = `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `💡 **Ready to place a bet?**\n\n` +
+        `Just tell me:\n` +
+        `• "bet $10 YES on [market name]"\n` +
+        `• "bet $50 NO on [market name]"\n` +
+        `• "place $25 YES bet on [market name]"\n\n` +
+        `I'll help you buy shares of YES or NO on any market! 🎯`
+
+      return {
+        success: true,
+        message: `🏀 **Sports Prediction Markets**\n\n${formatted}${bettingInstructions}`,
+        data: { markets },
+        hasCloseButton: true
+      }
+    } catch (error) {
+      console.error('[AI Agent] Error fetching sports markets:', error)
+      return {
+        success: false,
+        message: "I encountered an error fetching sports markets. Please try again."
+      }
+    }
+  }
+
+  /**
+   * Execute: Place Bet
+   */
+  async executePlaceBet(message, userId, context, bot) {
+    try {
+      // Extract bet details from message using AI
+      const betIntent = await this.extractBetIntent(message, userId)
+      
+      if (!betIntent || !betIntent.hasBetIntent) {
+        return {
+          success: false,
+          message: "I couldn't understand your bet request. Please specify:\n" +
+            "• Market (e.g., \"Russia Ukraine ceasefire\")\n" +
+            "• Side: YES or NO\n" +
+            "• Amount (e.g., $10)\n\n" +
+            "Example: \"Bet $10 YES on Russia Ukraine ceasefire\""
+        }
+      }
+
+      const { marketQuery, side, amount } = betIntent
+
+      if (!marketQuery || !side || !amount) {
+        return {
+          success: false,
+          message: "I need the market, side (YES/NO), and amount to place a bet.\n\n" +
+            "Example: \"Bet $10 YES on Russia Ukraine ceasefire\""
+        }
+      }
+
+      // Search for the market
+      console.log(`[AI Agent] Searching for market: ${marketQuery}`)
+      const markets = await searchMarkets(marketQuery, 5)
+
+      if (markets.length === 0) {
+        return {
+          success: false,
+          message: `No markets found for "${marketQuery}". Try searching for a specific market first.`
+        }
+      }
+
+      // Use the first/most relevant market
+      const selectedMarket = markets[0]
+      const marketId = selectedMarket.id || selectedMarket.conditionId
+
+      // Prepare the bet
+      console.log(`[AI Agent] Preparing bet: ${side} $${amount} on market ${marketId}`)
+      const betResult = await prepareBet(marketId, side, parseFloat(amount))
+
+      if (!betResult.success) {
+        return {
+          success: false,
+          message: betResult.message || "Failed to prepare bet. Please try again."
+        }
+      }
+
+      // Store pending bet for confirmation
+      const actionKey = `bet_${userId}_${Date.now()}`
+      const pendingBetData = {
+        userId,
+        action: 'place_bet',
+        data: {
+          marketId,
+          marketQuestion: selectedMarket.question,
+          side: side.toUpperCase(),
+          amount: amount.toString(),
+          order: betResult.order
+        },
+        timestamp: Date.now()
+      }
+
+      this.pendingActions.set(actionKey, pendingBetData)
+      console.log(`[AI Agent] ✅ Stored pending bet: ${actionKey}`)
+
+      // Format confirmation message
+      const confirmationMessage = formatBetConfirmation({
+        order: betResult.order,
+        market: betResult.market
+      })
+
+      return {
+        success: true,
+        needsConfirmation: true,
+        action: 'place_bet',
+        message: confirmationMessage + `\n\nReply "yes" or "confirm" to place this bet, or "cancel" to abort.`,
+        data: {
+          marketId,
+          side: side.toUpperCase(),
+          amount: amount.toString(),
+          order: betResult.order
+        }
+      }
+    } catch (error) {
+      console.error('[AI Agent] Error placing bet:', error)
+      return {
+        success: false,
+        message: "I encountered an error preparing your bet. Please try again."
+      }
+    }
+  }
+
+  /**
+   * Extract bet intent from message
+   */
+  async extractBetIntent(message, userId = null) {
+    if (!this.openai) {
+      // Fallback to manual extraction
+      return this.manualExtractBet(message)
+    }
+
+    try {
+      const history = userId ? this.getConversationHistory(userId) : []
+      const recentHistory = history.slice(-8)
+
+      const systemPrompt = `You are a bet intent extractor for Polymarket betting.
+
+Extract betting details from the user's message. Return a JSON object with:
+- hasBetIntent: boolean
+- marketQuery: string (search query for the market, e.g., "Russia Ukraine ceasefire", "Lakers")
+- side: string ("YES" or "NO")
+- amount: number (bet amount in USD, e.g., 10 for $10)
+
+EXAMPLES:
+"Bet $10 YES on Russia Ukraine ceasefire"
+→ {"hasBetIntent": true, "marketQuery": "Russia Ukraine ceasefire", "side": "YES", "amount": 10}
+
+"Place a NO bet on Lakers for $50"
+→ {"hasBetIntent": true, "marketQuery": "Lakers", "side": "NO", "amount": 50}
+
+"I want to bet YES $25 on Super Bowl"
+→ {"hasBetIntent": true, "marketQuery": "Super Bowl", "side": "YES", "amount": 25}
+
+"Bet NO on market X"
+→ {"hasBetIntent": true, "marketQuery": "market X", "side": "NO", "amount": null} (amount needs clarification)
+
+If no bet intent found, return {"hasBetIntent": false}.`
+
+      const messages = [
+        { role: 'system', content: systemPrompt },
+        ...recentHistory.map(msg => ({ role: msg.role, content: msg.content })),
+        { role: 'user', content: message }
+      ]
+
+      const response = await this.queueOpenAIRequest(() =>
+        this.openai.chat.completions.create({
+          model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+          messages,
+          max_tokens: 150,
+          temperature: 0.2
+        })
+      )
+
+      const content = response.choices[0].message.content.trim()
+      let result
+
+      try {
+        result = JSON.parse(content)
+      } catch (e) {
+        // Fallback parsing
+        result = this.manualExtractBet(message)
+      }
+
+      return result
+    } catch (error) {
+      console.error('[AI Agent] Error extracting bet intent:', error)
+      return this.manualExtractBet(message)
+    }
+  }
+
+  /**
+   * Manual bet extraction (regex-based fallback)
+   */
+  manualExtractBet(message) {
+    const lowerMessage = message.toLowerCase()
+
+    // Extract side (YES/NO)
+    let side = null
+    if (lowerMessage.includes('yes')) {
+      side = 'YES'
+    } else if (lowerMessage.includes('no')) {
+      side = 'NO'
+    }
+
+    // Extract amount
+    const amountPatterns = [
+      /\$(\d+(?:\.\d+)?)/,
+      /(\d+(?:\.\d+)?)\s*(?:dollar|dollars|usd)/
+    ]
+
+    let amount = null
+    for (const pattern of amountPatterns) {
+      const match = message.match(pattern)
+      if (match) {
+        amount = parseFloat(match[1])
+        break
+      }
+    }
+
+    // Extract market query (everything after "on" or "for")
+    let marketQuery = null
+    const marketPatterns = [
+      /(?:bet|place|on|for)\s+(?:yes|no|yes|no)?\s*(?:on|for)?\s*(.+?)(?:\s+for|\s+\$|$)/i,
+      /on\s+(.+?)(?:\s+for|\s+\$|$)/i,
+      /for\s+(.+?)(?:\s+yes|\s+no|\s+\$|$)/i
+    ]
+
+    for (const pattern of marketPatterns) {
+      const match = message.match(pattern)
+      if (match && match[1]) {
+        marketQuery = match[1].trim()
+        // Clean up common words
+        marketQuery = marketQuery.replace(/\b(yes|no|bet|place|on|for|the|a|an)\b/gi, '').trim()
+        if (marketQuery.length > 2) {
+          break
+        }
+      }
+    }
+
+    if (side || amount || marketQuery) {
+      return {
+        hasBetIntent: true,
+        marketQuery: marketQuery || null,
+        side: side || null,
+        amount: amount || null
+      }
+    }
+
+    return { hasBetIntent: false }
+  }
+
+  /**
+   * Execute: View Bets
+   */
+  async executeViewBets(userId) {
+    try {
+      const bets = await getUserBets(userId)
+      const formatted = formatUserBets(bets)
+      
+      return {
+        success: true,
+        message: formatted,
+        data: { bets },
+        hasCloseButton: true
+      }
+    } catch (error) {
+      console.error('[AI Agent] Error viewing bets:', error)
+      return {
+        success: false,
+        message: "I encountered an error retrieving your bets. Please try again."
+      }
+    }
+  }
+
+  /**
+   * Execute: Bridge Funds
+   */
+  async executeBridgeFunds(message, userId, context, bot) {
+    try {
+      // Extract bridge intent
+      const bridgeIntent = await this.extractBridgeIntent(message, userId)
+      
+      if (!bridgeIntent || !bridgeIntent.hasBridgeIntent) {
+        return {
+          success: false,
+          message: "I couldn't understand your bridge request. Please specify:\n" +
+            "• Amount (e.g., $10) - optional\n" +
+            "• Token (e.g., USDC) - optional, defaults to USDC\n" +
+            "• Source chain (e.g., from Arbitrum) - optional, defaults to Base\n" +
+            "• Destination chain (e.g., to Polygon) - required\n\n" +
+            "Examples:\n" +
+            "• \"Bridge $10 USDC to Polygon\"\n" +
+            "• \"Bridge 10 USDC from Arbitrum to Base\"\n" +
+            "• \"Move funds from Optimism to BSC\""
+        }
+      }
+
+      const { amount, tokenSymbol, toChain, fromChain } = bridgeIntent
+      
+      // If amount is missing, ask user
+      if (!amount) {
+        return {
+          success: false,
+          message: `🌉 **Bridge Setup**\n\n` +
+            `I understand you want to bridge from ${fromChain || 'Base'} to ${toChain}.\n\n` +
+            `Please specify the amount:\n` +
+            `• "Bridge $10 USDC from ${fromChain || 'Base'} to ${toChain}"\n` +
+            `• "Bridge 25 ${tokenSymbol || 'USDC'} from ${fromChain || 'Base'} to ${toChain}"`
+        }
+      }
+      
+      // Determine source chain
+      let fromChainConfig
+      if (fromChain) {
+        // User specified source chain
+        fromChainConfig = CHAINS[fromChain]
+        if (!fromChainConfig) {
+          return {
+            success: false,
+            message: `❌ Invalid source chain: ${fromChain}. Supported chains: ${Object.keys(CHAINS).join(', ')}`
+          }
+        }
+      } else {
+        // Default to Base
+        fromChainConfig = CHAINS.BASE
+      }
+      
+      // Determine destination chain
+      const toChainConfig = CHAINS[toChain]
+      if (!toChainConfig) {
+        return {
+          success: false,
+          message: `❌ Invalid destination chain: ${toChain}. Supported chains: ${Object.keys(CHAINS).join(', ')}`
+        }
+      }
+
+      // Check if same chain
+      if (fromChainConfig.chainId === toChainConfig.chainId) {
+        return {
+          success: false,
+          message: `❌ Source and destination chains are the same (${fromChainConfig.name}). No bridge needed.`
+        }
+      }
+
+      // Get user
+      const user = await dbGet('SELECT username FROM telegram_users WHERE telegram_id = ?', [userId])
+      if (!user || !user.username) {
+        return {
+          success: false,
+          message: "❌ You don't have a registered wallet. Please register first."
+        }
+      }
+
+      // Execute bridge
+      if (bot) {
+        await bot.sendMessage(
+          userId,
+          `🌉 **Bridging Funds**\n\n` +
+          `• Amount: $${amount} ${tokenSymbol || 'USDC'}\n` +
+          `• From: ${fromChainConfig.name}\n` +
+          `• To: ${toChainConfig.name}\n\n` +
+          `⏳ Processing bridge transaction...`
+        )
+      }
+
+      const result = await executeBridge(
+        userId,
+        user.username,
+        fromChainConfig.chainId,
+        toChainConfig.chainId,
+        tokenSymbol || 'USDC',
+        amount,
+        bot
+      )
+
+      return result
+    } catch (error) {
+      console.error('[AI Agent] Error bridging funds:', error)
+      return {
+        success: false,
+        message: `Error bridging funds: ${error.message}`
+      }
+    }
+  }
+
+  /**
+   * Extract bridge intent from message
+   */
+  async extractBridgeIntent(message, userId = null) {
+    // Manual extraction for common patterns
+    const lowerMessage = message.toLowerCase()
+    
+    // Extract amount
+    const amountMatch = message.match(/\$?(\d+(?:\.\d+)?)/)
+    const amount = amountMatch ? amountMatch[1] : null
+
+    // Extract token
+    let tokenSymbol = 'USDC' // Default
+    if (lowerMessage.includes('usdt')) tokenSymbol = 'USDT'
+    else if (lowerMessage.includes('usdc')) tokenSymbol = 'USDC'
+    else if (lowerMessage.includes('wbtc')) tokenSymbol = 'WBTC'
+    else if (lowerMessage.includes('dai')) tokenSymbol = 'DAI'
+
+    // Chain keywords mapping
+    const chainKeywords = {
+      'ethereum': 'ETHEREUM',
+      'eth': 'ETHEREUM',
+      'mainnet': 'ETHEREUM',
+      'base': 'BASE',
+      'base mainnet': 'BASE_MAINNET',
+      'polygon': 'POLYGON',
+      'matic': 'POLYGON',
+      'arbitrum': 'ARBITRUM',
+      'arb': 'ARBITRUM',
+      'optimism': 'OPTIMISM',
+      'op': 'OPTIMISM',
+      'avalanche': 'AVALANCHE',
+      'avax': 'AVALANCHE',
+      'bsc': 'BSC',
+      'binance': 'BSC',
+      'bnb': 'BSC',
+      'bnb chain': 'BSC',
+      'zksync': 'ZKSYNC_ERA',
+      'zksync era': 'ZKSYNC_ERA',
+      'zk sync': 'ZKSYNC_ERA',
+      'linea': 'LINEA',
+      'scroll': 'SCROLL',
+      'mantle': 'MANTLE',
+      'blast': 'BLAST'
+    }
+
+    // Extract source chain (from)
+    let fromChain = null
+    const fromPatterns = [
+      /(?:bridge|move|send).*?from\s+([a-z\s]+?)(?:\s+chain)?(?:\s+to|\s|$)/i,
+      /from\s+([a-z\s]+?)(?:\s+chain)?(?:\s+to)/i,
+    ]
+    
+    for (const pattern of fromPatterns) {
+      const match = lowerMessage.match(pattern)
+      if (match) {
+        const chainName = match[1]?.trim()
+        if (chainName) {
+          // Check if it matches any chain keyword
+          for (const [keyword, chain] of Object.entries(chainKeywords)) {
+            if (chainName.includes(keyword)) {
+              fromChain = chain
+              break
+            }
+          }
+          if (fromChain) break
+        }
+      }
+    }
+
+    // Extract destination chain (to)
+    let toChain = null
+    const toPatterns = [
+      /(?:bridge|move|send).*?to\s+([a-z\s]+?)(?:\s+chain)?(?:\s|$|\.)/i,
+      /to\s+([a-z\s]+?)(?:\s+chain)?(?:\s|$|\.)/i,
+    ]
+    
+    for (const pattern of toPatterns) {
+      const match = lowerMessage.match(pattern)
+      if (match) {
+        const chainName = match[1]?.trim()
+        if (chainName) {
+          // Check if it matches any chain keyword
+          for (const [keyword, chain] of Object.entries(chainKeywords)) {
+            if (chainName.includes(keyword)) {
+              toChain = chain
+              break
+            }
+          }
+          if (toChain) break
+        }
+      }
+    }
+
+    // Fallback: if no explicit "from/to" patterns, try to find chains mentioned
+    if (!fromChain || !toChain) {
+      const foundChains = []
+      for (const [keyword, chain] of Object.entries(chainKeywords)) {
+        if (lowerMessage.includes(keyword)) {
+          foundChains.push(chain)
+        }
+      }
+      
+      // If we found 2 chains and one is missing, infer it
+      if (foundChains.length === 2) {
+        if (!fromChain) fromChain = foundChains[0]
+        if (!toChain) toChain = foundChains[1]
+      } else if (foundChains.length === 1) {
+        // Only one chain found - assume it's destination, source is Base
+        if (!toChain) toChain = foundChains[0]
+        if (!fromChain) fromChain = 'BASE' // Default source
+      }
+    }
+
+    // Validate we have required fields (toChain is required, amount can be null)
+    if (toChain) {
+      return {
+        hasBridgeIntent: true,
+        amount,
+        tokenSymbol,
+        toChain,
+        fromChain: fromChain || 'BASE' // Default to Base if not specified
+      }
+    }
+
+    return { hasBridgeIntent: false }
+  }
+
+  /**
+   * Execute: Check Cross-Chain Balance
+   */
+  async executeCheckCrossChainBalance(message, userId, context) {
+    try {
+      const user = await dbGet('SELECT wallet_address FROM telegram_users WHERE telegram_id = ?', [userId])
+      if (!user || !user.wallet_address) {
+        return {
+          success: false,
+          message: "❌ Wallet not found. Please register first."
+        }
+      }
+
+      // Check balances on all major chains
+      const chains = [
+        CHAINS.BASE,
+        CHAINS.BASE_MAINNET,
+        CHAINS.POLYGON,
+        CHAINS.ARBITRUM,
+        CHAINS.OPTIMISM,
+        CHAINS.AVALANCHE,
+        CHAINS.BSC,
+        CHAINS.ETHEREUM,
+        CHAINS.ZKSYNC_ERA,
+        CHAINS.LINEA,
+        CHAINS.SCROLL,
+        CHAINS.MANTLE,
+        CHAINS.BLAST
+      ]
+      const balances = []
+
+      for (const chain of chains) {
+        const balance = await getChainBalance(user.wallet_address, 'USDC', chain.chainId)
+        if (balance.success) {
+          balances.push({
+            chain: chain.name,
+            balance: balance.balanceFormatted
+          })
+        }
+      }
+
+      let message = `💰 **Your Cross-Chain Balances:**\n\n`
+      balances.forEach(b => {
+        message += `${b.chain}: $${b.balance.toFixed(2)} USDC\n`
+      })
+
+      return {
+        success: true,
+        message,
+        data: { balances }
+      }
+    } catch (error) {
+      console.error('[AI Agent] Error checking cross-chain balance:', error)
+      return {
+        success: false,
+        message: `Error checking balances: ${error.message}`
+      }
+    }
+  }
+
+  /**
+   * Execute: Education - Gen Z style explanation of SendCash
+   */
+  async executeEducation() {
+    return {
+      success: true,
+      message: `✨ **yo, what's good? i'm sender, your ai wallet assistant** ✨\n\n` +
+        `think of me as your crypto bestie who's always got your back 💪\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `🎯 **what we're cooking here:**\n\n` +
+        `sendcash is basically your all-in-one crypto wallet that's actually smart. ` +
+        `we're talking gasless transactions, instant payments, and an ai that actually understands you. ` +
+        `no cap, this is the future of crypto payments 🚀\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `💰 **money moves (payments & balance)**\n\n` +
+        `• check your balance anytime: "what's my balance?"\n` +
+        `• send money to friends: "send $10 to @alice"\n` +
+        `• pay for stuff: "pay bob 50 USDC for lunch"\n` +
+        `• **multi-chain payments**: "send @jamiu 10 USDC on BNB chain" or "pay bob 50 USDT on polygon"\n` +
+        `• schedule payments: "send $20 to @mom tomorrow at 3pm"\n` +
+        `• view scheduled payments: "show my scheduled payments"\n` +
+        `• cancel if needed: "cancel payment #1"\n\n` +
+        `*best part? gasless transactions across ALL chains. you don't pay gas fees. we got you.* ⛽💸\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `💱 **token swaps (degen mode)**\n\n` +
+        `swap any token instantly, no questions asked:\n` +
+        `• "swap 100 USDC to USDT"\n` +
+        `• "convert 50 USDT to WBTC"\n` +
+        `• "exchange 200 USDC for ETH"\n\n` +
+        `*we use uniswap v3 for the best rates. your money, optimized.* 📈\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `🎮 **game predictions & betting (polymarket integration)**\n\n` +
+        `okay this is where it gets fun. we're integrated with polymarket, so you can:\n\n` +
+        `• get ai-powered predictions: "predict lakers vs warriors"\n` +
+        `• search markets: "search markets for nba"\n` +
+        `• view sports markets: "show sports markets"\n` +
+        `• place bets: "bet $10 YES on russia ukraine ceasefire"\n` +
+        `• check your bets: "show my bets"\n\n` +
+        `*yes, you can bet on literally anything. sports, politics, crypto, you name it.* 🎲\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `🌉 **multichain bridge (we're everywhere)**\n\n` +
+        `bridge funds across 13+ chains like it's nothing:\n\n` +
+        `• "bridge $10 USDC to polygon"\n` +
+        `• "bridge $50 to arbitrum"\n` +
+        `• "move funds to optimism"\n` +
+        `• "send $25 to ethereum"\n` +
+        `• "check my balance on polygon"\n\n` +
+        `**multi-chain payments (auto-bridge):**\n` +
+        `• "send @jamiu 10 USDC on BNB chain" - automatically bridges & pays!\n` +
+        `• "pay bob 50 USDT on polygon" - seamless cross-chain payment\n` +
+        `• works on: BSC, Polygon, Arbitrum, Optimism, Ethereum, Avalanche, Base, zkSync, Linea, Scroll, Mantle, Blast\n\n` +
+        `*we use socket protocol + ERC-4337 for gasless cross-chain payments. no cap.* 🌐\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `🤖 **how i work (the tech stuff)**\n\n` +
+        `• **smart wallets**: account abstraction = no seed phrases, no gas fees\n` +
+        `• **ai-powered**: i understand natural language. just talk to me like a human\n` +
+        `• **multichain**: your wallet works across all major evm chains\n` +
+        `• **instant**: transactions are fast. like, really fast\n` +
+        `• **secure**: your keys, your crypto. we just make it easier\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `💡 **pro tips**\n\n` +
+        `• just talk to me naturally. i get it\n` +
+        `• use @username for payments (no addresses needed)\n` +
+        `• schedule payments for later (set it and forget it)\n` +
+        `• bridge funds before betting on polymarket (it's on polygon)\n` +
+        `• check balances across chains anytime\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `🎯 **what makes us different?**\n\n` +
+        `✨ gasless transactions (we pay the gas)\n` +
+        `✨ ai that actually understands you\n` +
+        `✨ username-based payments (no addresses)\n` +
+        `✨ multichain by default\n` +
+        `✨ betting & predictions built-in\n` +
+        `✨ scheduled payments\n` +
+        `✨ instant swaps\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `**ready to get started?** just ask me anything:\n` +
+        `• "send $10 to @friend"\n` +
+        `• "what's my balance?"\n` +
+        `• "predict lakers game"\n` +
+        `• "bridge to polygon"\n\n` +
+        `*let's make crypto actually usable. no cap.* 🚀✨\n\n` +
+        `*p.s. - i'm always learning. if something doesn't work, just tell me and i'll figure it out.* 🧠`,
+      hasCloseButton: true
+    }
+  }
+
   /**
    * Execute: Help
    */
   async executeHelp() {
     return {
       success: true,
-      message: `🤖 **I'm Sender, your AI assistant for SendCash!**\n\n` +
-        `I can help you with:\n\n` +
+      message: `✨ **hey! i'm sender, your ai wallet assistant** ✨\n\n` +
+        `want the full breakdown? just ask: "what can you do" or "tell me about sendcash"\n\n` +
+        `**quick commands:**\n\n` +
         `💰 **Balance & Payments**\n` +
         `• "What's my balance?"\n` +
         `• "Send $10 to @alice"\n` +
@@ -2486,7 +3460,36 @@ Return ONLY valid JSON, no other text.`
         `🔐 **Security**\n` +
         `• "Export my private key"\n` +
         `• "Show my private key"\n\n` +
-        `Just chat with me naturally - I understand what you need! ✨`
+        `🎯 **Game Predictions**\n` +
+        `• "Predict Lakers vs Warriors"\n` +
+        `• "Who will win the Super Bowl"\n` +
+        `• "Game prediction for Lakers"\n` +
+        `• "Search markets for NBA"\n` +
+        `• "Show sports markets"\n\n` +
+        `💰 **Place Bets**\n` +
+        `• "Bet $10 YES on Russia Ukraine ceasefire"\n` +
+        `• "Place NO bet on Lakers for $50"\n` +
+        `• "I want to bet YES $25 on Super Bowl"\n` +
+        `• "Show my bets"\n\n` +
+        `🌉 **Multichain Bridge & Payments** (Base → Any EVM Chain)\n` +
+        `• "Bridge $10 USDC to Polygon"\n` +
+        `• "Bridge $50 to Arbitrum"\n` +
+        `• "Move funds to Optimism"\n` +
+        `• "Send $25 to Ethereum"\n` +
+        `• "Bridge to Avalanche"\n` +
+        `• "My balance on Polygon"\n` +
+        `• "Check balances across chains"\n\n` +
+        `**Multi-Chain Payments (Auto-Bridge):**\n` +
+        `• "send @jamiu 10 USDC on BNB chain" - auto-bridges & pays!\n` +
+        `• "pay bob 50 USDT on polygon" - seamless cross-chain\n` +
+        `• "send 100 USDC to alice on arbitrum"\n\n` +
+        `Supported Chains: Ethereum, Base, Polygon, Arbitrum, Optimism, Avalanche, BSC, zkSync, Linea, Scroll, Mantle, Blast\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `💡 **want to learn more?**\n` +
+        `• "what can you do" - full feature breakdown\n` +
+        `• "tell me about sendcash" - what we're building\n` +
+        `• "how does this work" - tech explained\n\n` +
+        `just chat with me naturally - i understand what you need! ✨`
     }
   }
 
@@ -2494,6 +3497,47 @@ Return ONLY valid JSON, no other text.`
    * Execute: General Chat
    */
   async executeGeneralChat(message, userId, context = {}) {
+    // Check if this is an education query
+    const lowerMessage = message.toLowerCase()
+    const educationKeywords = [
+      'what can you do',
+      'tell me about sendcash',
+      'what is sendcash',
+      'what is this',
+      'how does this work',
+      'what are you',
+      'explain sendcash',
+      'show me what you can do',
+      'what features do you have',
+      'what do you do',
+      'what can i do',
+      'what\'s this about',
+      'what are we building',
+      'what are you cooking'
+    ]
+    
+    if (educationKeywords.some(keyword => lowerMessage.includes(keyword))) {
+      return await this.executeEducation()
+    }
+
+    // Check if this is a general Polymarket query
+    const polymarketKeywords = [
+      'polymarket',
+      'prediction market',
+      'prediction markets',
+      'betting markets',
+      'what markets',
+      'show markets',
+      'list markets',
+      'available markets'
+    ]
+    
+    if (polymarketKeywords.some(keyword => lowerMessage.includes(keyword))) {
+      // Route to market search/view
+      console.log('[AI Agent] Detected Polymarket query in general chat, routing to market search')
+      return await this.executeSearchMarkets(message)
+    }
+
     if (!this.openai) {
       return {
         success: false,
@@ -2504,7 +3548,7 @@ Return ONLY valid JSON, no other text.`
     try {
       // Get current time for context
       const now = new Date()
-      const currentTime = now.toLocaleString('en-US', { 
+      const currentTime = now.toLocaleString('en-US', {
         timeZone: 'UTC',
         weekday: 'long',
         year: 'numeric',
@@ -2673,16 +3717,68 @@ Remember: Be honest about limitations. Don't make up prices or real-time data.`
     // Execute the action
     try {
       if (pendingAction.action === 'send_payment') {
-        const { recipient, amount, tokenSymbol, memo } = pendingAction.data
+        const { recipient, amount, tokenSymbol, memo, chain, sourceChain, bridgeNeeded, cheapestRoute, useAnyChain } = pendingAction.data
         
-        const result = await executePayment(
-          userId,
-          recipient,
-          amount,
-          tokenSymbol,
-          bot,
-          memo
-        )
+        // If chain is specified OR bridge is needed, route to multi-chain payment handler
+        if (chain || sourceChain || bridgeNeeded) {
+          const { executeMultiChainPayment } = await import('./multiChainPayment.js')
+          const result = await executeMultiChainPayment(
+            userId,
+            recipient,
+            amount,
+            tokenSymbol,
+            chain || null,
+            bot,
+            memo,
+            sourceChain || null,
+            cheapestRoute || false,
+            useAnyChain || false
+          )
+          
+          this.pendingActions.delete(actionKey)
+          
+          if (result.success) {
+            this.addToConversationHistory(userId, 'assistant', result.message)
+            return result
+          } else {
+            return result
+          }
+        }
+        
+        // ✅ CRITICAL FIX: Execute payment with proper error handling
+        let result
+        try {
+          result = await executePayment(
+            userId,
+            recipient,
+            amount,
+            tokenSymbol,
+            bot,
+            memo
+          )
+        } catch (error) {
+          console.error('[AI Agent] Payment execution error:', error)
+          this.pendingActions.delete(actionKey)
+          
+          // Notify user of failure
+          if (bot) {
+            await bot.sendMessage(userId,
+              `❌ **Payment Failed**\n\n` +
+              `I encountered an error while processing your payment:\n` +
+              `${error.message}\n\n` +
+              `Please check:\n` +
+              `• Your balance is sufficient\n` +
+              `• The recipient username is correct\n` +
+              `• Try again in a moment\n\n` +
+              `If this persists, please contact support.`
+            )
+          }
+          
+          return {
+            success: false,
+            message: `❌ Payment failed: ${error.message}. Please check your balance and try again.`
+          }
+        }
         
         // Remove pending action
         this.pendingActions.delete(actionKey)
@@ -2690,8 +3786,22 @@ Remember: Be honest about limitations. Don't make up prices or real-time data.`
         if (result.success) {
           // Add to conversation history
           this.addToConversationHistory(userId, 'assistant', result.message)
+          
+          // ✅ CRITICAL FIX: Start transaction status polling
+          if (result.data && result.data.txHash && bot) {
+            this.pollTransactionStatus(userId, result.data.txHash, bot)
+          }
+          
           return result
         } else {
+          // ✅ CRITICAL FIX: Notify user of failure
+          if (bot) {
+            await bot.sendMessage(userId,
+              `❌ **Payment Failed**\n\n` +
+              `${result.message || "Payment could not be completed. Please check your balance and try again."}`
+            )
+          }
+          
           return {
             success: false,
             message: result.message || "Payment failed. Please check your balance and try again."
@@ -2704,6 +3814,56 @@ Remember: Be honest about limitations. Don't make up prices or real-time data.`
           success: true,
           message: "Registration confirmed. Processing..."
         }
+      } else if (pendingAction.action === 'place_bet') {
+        const { marketId, side, amount, order } = pendingAction.data
+        
+        // Get user info to get private key
+        const user = await dbGet('SELECT username FROM telegram_users WHERE telegram_id = ?', [userId])
+        if (!user || !user.username) {
+          this.pendingActions.delete(actionKey)
+          return {
+            success: false,
+            message: "❌ You don't have a registered wallet. Please register a username first."
+          }
+        }
+
+        // Get user's private key
+        const privateKey = exportPrivateKey(userId, user.username)
+        
+        // Execute the bet
+        try {
+          await bot.sendMessage(userId, `⏳ Placing your ${side} bet on Polymarket...`)
+          
+          const result = await executeBet(
+            userId,
+            marketId,
+            side,
+            parseFloat(amount),
+            privateKey,
+            order.price
+          )
+          
+          this.pendingActions.delete(actionKey)
+          
+          if (result.success) {
+            return {
+              success: true,
+              message: result.message
+            }
+          } else {
+            return {
+              success: false,
+              message: result.message || "Failed to place bet. Please try again."
+            }
+          }
+        } catch (error) {
+          console.error('[AI Agent] Error executing bet:', error)
+          this.pendingActions.delete(actionKey)
+          return {
+            success: false,
+            message: `Error placing bet: ${error.message}`
+          }
+        }
       }
       
       return {
@@ -2713,11 +3873,103 @@ Remember: Be honest about limitations. Don't make up prices or real-time data.`
     } catch (error) {
       console.error('[AI Agent] Error executing confirmed action:', error)
       this.pendingActions.delete(actionKey)
+      
+      // ✅ CRITICAL FIX: Notify user of error
+      if (bot) {
+        try {
+          await bot.sendMessage(userId,
+            `❌ **Error Executing Action**\n\n` +
+            `I encountered an error while processing your request:\n` +
+            `${error.message}\n\n` +
+            `Please try again or contact support if this persists.`
+          )
+        } catch (sendError) {
+          console.error('[AI Agent] Failed to send error notification:', sendError)
+        }
+      }
+      
       const friendlyError = getUserFriendlyError(error, 'payment')
       return {
         success: false,
         message: friendlyError.message || friendlyError || "I encountered an error. Please try again."
       }
+    }
+  }
+
+  /**
+   * Poll transaction status and notify user
+   * ✅ CRITICAL FIX: Transaction status tracking
+   */
+  async pollTransactionStatus(userId, txHash, bot) {
+    try {
+      const provider = await getProviderWithRetry()
+      let confirmations = 0
+      const maxConfirmations = 12
+      const pollInterval = 5000 // 5 seconds
+      const maxPolls = 24 // 2 minutes total
+      let pollCount = 0
+      
+      // Determine explorer URL based on network
+      const explorerUrl = BASE_RPC.includes('sepolia')
+        ? 'https://sepolia-explorer.base.org'
+        : 'https://basescan.org'
+      
+      const poll = async () => {
+        try {
+          const receipt = await provider.getTransactionReceipt(txHash)
+          
+          if (receipt) {
+            if (receipt.status === 1) {
+              const currentBlock = await provider.getBlockNumber()
+              confirmations = currentBlock - receipt.blockNumber + 1
+              
+              if (confirmations === 1) {
+                await bot.sendMessage(userId,
+                  `✅ **Payment Confirmed!**\n\n` +
+                  `Transaction: [View on Explorer](${explorerUrl}/tx/${txHash})\n\n` +
+                  `⏳ Waiting for more confirmations...`
+                )
+              } else if (confirmations >= 3) {
+                await bot.sendMessage(userId,
+                  `✅ **Payment Fully Confirmed!**\n\n` +
+                  `${confirmations} block confirmations\n` +
+                  `Transaction: [View](${explorerUrl}/tx/${txHash})`
+                )
+                return // Stop polling
+              }
+            } else {
+              await bot.sendMessage(userId,
+                `❌ **Transaction Failed**\n\n` +
+                `Your transaction was reverted on-chain.\n` +
+                `Transaction: [View](${explorerUrl}/tx/${txHash})\n\n` +
+                `Please try again or contact support.`
+              )
+              return // Stop polling
+            }
+          }
+          
+          pollCount++
+          if (pollCount < maxPolls) {
+            setTimeout(poll, pollInterval)
+          } else {
+            await bot.sendMessage(userId,
+              `⏳ **Transaction Pending**\n\n` +
+              `Your transaction is still pending. This can happen during network congestion.\n` +
+              `Transaction: [View](${explorerUrl}/tx/${txHash})\n\n` +
+              `I'll keep checking and notify you when it confirms.`
+            )
+          }
+        } catch (error) {
+          console.error('[AI Agent] Error polling transaction:', error)
+          // Don't notify user of polling errors, just log
+        }
+      }
+      
+      // Start polling after 5 seconds
+      setTimeout(poll, 5000)
+    } catch (error) {
+      console.error('[AI Agent] Error setting up transaction polling:', error)
+      // Don't notify user, just log
     }
   }
 

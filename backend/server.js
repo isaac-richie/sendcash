@@ -1,14 +1,18 @@
+import dotenv from 'dotenv'
+dotenv.config()
+
 import express from 'express'
 import cors from 'cors'
-import dotenv from 'dotenv'
 import TelegramBot from 'node-telegram-bot-api'
-import { initDatabase } from './services/database.js'
+// Use Supabase database service (automatically falls back to SQLite if env vars not set)
+import { initDatabase } from './services/databaseSupabase.js'
 import { usernameRoutes } from './routes/username.js'
 import { paymentRoutes } from './routes/payment.js'
 import { transactionRoutes } from './routes/transactions.js'
 // import { botHandlers } from './bot/handlers.js' // Disabled - using Sender AI
 import { senderBotHandlers } from './bot/senderHandlers.js'
-import { getPaymentScheduler } from './services/paymentScheduler.js'
+import { getPaymentScheduler } from './services/paymentSchedulerCron.js'
+import { registerBot } from './services/botRegistry.js'
 
 dotenv.config()
 
@@ -49,10 +53,13 @@ if (TELEGRAM_BOT_TOKEN) {
     console.error('Error setting bot commands:', err)
   })
   
+  // Register bot instance for queue workers
+  registerBot(bot)
+  
   // Register Sender AI bot handlers
   senderBotHandlers(bot)
   
-  // Start payment scheduler
+  // Start payment scheduler (cron + queue)
   const scheduler = getPaymentScheduler(bot)
   scheduler.start()
   

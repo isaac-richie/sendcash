@@ -110,7 +110,7 @@ Recipients are automatically notified when payments arrive.
 - **Node.js** + **Express** for API
 - **Thirdweb SDK** for account abstraction
 - **Telegram Bot API** for user interface
-- **SQLite** for local data storage
+- **Database**: SQLite (default) or Supabase PostgreSQL when `SUPABASE_URL` + `SUPABASE_KEY` are set
 
 ### Key Contracts
 - `UsernameRegistry.sol` - Maps usernames to wallet addresses
@@ -158,6 +158,7 @@ Update `.env` with:
 - `RELAYER_PRIVATE_KEY` - Wallet for sponsoring gas
 - Contract addresses (after deployment)
 - Token addresses (USDC/USDT on Base Sepolia)
+- _(Optional)_ Supabase: `SUPABASE_URL` and `SUPABASE_KEY` to use Supabase instead of SQLite
 
 4. **Deploy contracts**
 ```bash
@@ -237,6 +238,7 @@ Transactions are sponsored by a relayer, so users never pay gas:
 - Balance checking
 - Transaction history
 - Telegram bot interface
+- Supabase configuration validated (falls back to SQLite if Supabase env vars are not set)
 
 🚧 **In Progress**
 - Premium usernames

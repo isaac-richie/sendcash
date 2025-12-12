@@ -20,9 +20,11 @@ import { getPaymentScheduler } from './paymentScheduler.js'
  * @param {string} amount - Amount as string (e.g., "10")
  * @param {string} tokenSymbol - Token symbol (USDC, USDT, etc.)
  * @param {Object} bot - Telegram bot instance
+ * @param {string} memo - Optional memo
+ * @param {number} targetChainId - Optional target chain ID (defaults to Base)
  * @returns {Promise<Object>} Execution result
  */
-export const executePayment = async (userId, recipientUsername, amount, tokenSymbol, bot, memo = null) => {
+export const executePayment = async (userId, recipientUsername, amount, tokenSymbol, bot, memo = null, targetChainId = null) => {
   console.log(`[AI Actions] executePayment called:`, { userId, recipientUsername, amount, tokenSymbol, memo })
   
   try {
@@ -60,7 +62,29 @@ export const executePayment = async (userId, recipientUsername, amount, tokenSym
 
     console.log(`[AI Actions] User found:`, { username: user.username, wallet: user.wallet_address })
 
-    // Validate token
+    // If target chain is specified and different from Base, route to multi-chain handler
+    if (targetChainId && targetChainId !== 84532) { // 84532 is Base Sepolia
+      const { executeMultiChainPayment } = await import('./multiChainPayment.js')
+      const { getChainConfig } = await import('./chainDetector.js')
+      
+      // Find chain key from chainId
+      const { CHAINS } = await import('./bridgeService.js')
+      const chainKey = Object.keys(CHAINS).find(key => CHAINS[key].chainId === targetChainId)
+      
+      if (chainKey) {
+        return await executeMultiChainPayment(
+          userId,
+          recipientUsername,
+          amount,
+          tokenSymbol,
+          chainKey,
+          bot,
+          memo
+        )
+      }
+    }
+
+    // Validate token (for Base chain)
     if (!TOKENS[tokenSymbol] || !TOKENS[tokenSymbol].address) {
       const friendlyError = getUserFriendlyError(
         `Token ${tokenSymbol} not supported. Available: ${Object.keys(TOKENS).join(', ')}`,
@@ -87,7 +111,7 @@ export const executePayment = async (userId, recipientUsername, amount, tokenSym
 
     // Validate recipient username exists BEFORE preparing transaction
     try {
-      const registry = getUsernameRegistry()
+      const registry = await getUsernameRegistry()
       // ✅ FIX: Use usernameToAddress mapping directly instead of getAddress()
       // getAddress() has a bug that returns registry address for non-existent usernames
       const recipientAddress = await registry.usernameToAddress(recipientUsername.toLowerCase())
@@ -179,12 +203,23 @@ export const executePayment = async (userId, recipientUsername, amount, tokenSym
       throw txError // Re-throw to be caught by outer catch
     }
 
-    // Store payment
+    // Store payment (include target chain if specified)
     try {
+      let targetChainName = null
+      if (targetChainId && targetChainId !== 84532) { // 84532 is Base Sepolia
+        const { CHAINS } = await import('./bridgeService.js')
+        const chainKey = Object.keys(CHAINS).find(key => CHAINS[key].chainId === targetChainId)
+        if (chainKey) {
+          const { getChainConfig } = await import('./chainDetector.js')
+          const chainConfig = getChainConfig(chainKey)
+          targetChainName = chainConfig?.name || null
+        }
+      }
+
       await dbRun(
         `INSERT INTO payments 
-         (tx_hash, from_address, to_address, from_username, to_username, token_address, amount, fee, status, memo)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+         (tx_hash, from_address, to_address, from_username, to_username, token_address, amount, fee, status, memo, target_chain, target_chain_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
         [
           txHash,
           user.wallet_address,
@@ -194,7 +229,9 @@ export const executePayment = async (userId, recipientUsername, amount, tokenSym
           TOKENS[tokenSymbol].address,
           txData.amount,
           txData.fee,
-          memo || null
+          memo || null,
+          targetChainName || null,
+          targetChainId || null
         ]
       )
     } catch (dbError) {
@@ -315,6 +352,7 @@ export const executeRegisterUsername = async (userId, username, bot) => {
     // Import registration function
     const { createSmartWalletForUsername, registerUsernameInRegistry, isSmartWalletDeployed } = await import('./thirdwebWallet.js')
 
+    // Send progress messages (these are fine - they're status updates)
     await bot.sendMessage(userId, `⏳ Creating your wallet and registering @${username}...`)
 
     // Create wallet
@@ -329,6 +367,8 @@ export const executeRegisterUsername = async (userId, username, bot) => {
     // Register username
     await bot.sendMessage(userId, '⏳ Registering username on-chain (free during test phase)...')
     const regResult = await registerUsernameInRegistry(username, walletAddress)
+    
+    console.log(`[AI Actions] Registration complete for @${username}, wallet: ${walletAddress}`)
 
     // Store in database (INSERT OR REPLACE to handle both new and existing users)
     await dbRun(
@@ -336,17 +376,25 @@ export const executeRegisterUsername = async (userId, username, bot) => {
       [userId, walletAddress, username]
     )
 
+    // Build final success message
+    const successMessage = `✅ Awesome! Welcome to SendCash, @${username}! 🎉\n\n` +
+      `Your smart wallet has been created and is ready to use!\n\n` +
+      `💰 You can now:\n` +
+      `• Receive payments via @${username}\n` +
+      `• Send payments (just chat with me naturally!)\n` +
+      `• Check your balance anytime\n\n` +
+      `💡 All transactions are gasless thanks to account abstraction!\n\n` +
+      `Try asking me: "What's my balance?" or "Send $10 to @alice" 🚀`
+
+    // Return message in result - handler will send it ONCE
+    // Note: Progress messages (lines 318, 326, 330) are sent directly as status updates
+    // Final success message is returned here and sent by handler to avoid duplicates
+    console.log(`[AI Actions] Registration complete - returning success message for handler to send`)
     return {
       success: true,
-      message: `✅ Awesome! Welcome to SendCash, @${username}! 🎉\n\n` +
-        `Your smart wallet has been created and is ready to use!\n\n` +
-        `💰 You can now:\n` +
-        `• Receive payments via @${username}\n` +
-        `• Send payments (just chat with me naturally!)\n` +
-        `• Check your balance anytime\n\n` +
-        `💡 All transactions are gasless thanks to account abstraction!\n\n` +
-        `Try asking me: "What's my balance?" or "Send $10 to @alice" 🚀`,
+      message: successMessage,
       data: { walletAddress, username }
+      // Note: Don't set skipBotMessage - handler should send this final message
     }
   } catch (error) {
     console.error('[AI Actions] Error registering username:', error)
@@ -454,7 +502,7 @@ export const executeSchedulePayment = async (userId, recipientUsername, amount, 
 
     // Validate recipient username exists
     try {
-      const registry = getUsernameRegistry()
+      const registry = await getUsernameRegistry()
       // ✅ FIX: Use usernameToAddress mapping directly instead of getAddress()
       const recipientAddress = await registry.usernameToAddress(recipientUsername.toLowerCase())
       

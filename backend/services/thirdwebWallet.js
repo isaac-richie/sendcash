@@ -5,6 +5,7 @@ import { privateKeyToAccount } from "thirdweb/wallets";
 import { ethers } from 'ethers';
 import dotenv from 'dotenv';
 import { BASE_RPC } from './config.js';
+import { CHAINS } from './bridgeService.js';
 
 // Ensure dotenv is loaded before accessing env vars
 dotenv.config();
@@ -181,6 +182,130 @@ export const getSmartWalletForUser = async (username, telegramUserId) => {
     throw error;
   }
 };
+
+/**
+ * Get or create smart wallet on a specific chain
+ * @param {string} username - Username
+ * @param {number} telegramUserId - Telegram user ID
+ * @param {number} chainId - Target chain ID
+ * @returns {Promise<Object>} Wallet address and smart wallet instance for the chain
+ */
+export const getSmartWalletForChain = async (username, telegramUserId, chainId) => {
+  try {
+    console.log(`[getSmartWalletForChain] Creating wallet for chain ${chainId}`)
+    
+    // Find chain config
+    const chainConfig = Object.values(CHAINS).find(c => c.chainId === chainId)
+    if (!chainConfig) {
+      throw new Error(`Chain ${chainId} not supported`)
+    }
+
+    // Create deterministic personal wallet (same across all chains)
+    const personalAccount = createPersonalWallet(telegramUserId, username)
+    const accountAddress = personalAccount.address
+
+    if (!accountAddress) {
+      throw new Error('Failed to get account address from personal account')
+    }
+
+    // Define chain for Thirdweb
+    const thirdwebChain = defineChain({
+      id: chainId,
+      name: chainConfig.name,
+      nativeCurrency: chainConfig.nativeCurrency || { name: 'ETH', symbol: 'ETH', decimals: 18 },
+      rpc: chainConfig.rpc,
+      blockExplorers: chainConfig.blockExplorer ? [{ name: 'Explorer', url: chainConfig.blockExplorer }] : undefined,
+      testnet: chainId !== 1 && chainId !== 137 && chainId !== 42161 && chainId !== 10 && chainId !== 43114 && chainId !== 56 && chainId !== 324 && chainId !== 59144 && chainId !== 534352 && chainId !== 5000 && chainId !== 81457 && chainId !== 8453
+    })
+
+    // Get factory address (use default if not set)
+    let factoryAddress = process.env.THIRDWEB_FACTORY_ADDRESS
+    if (factoryAddress && (!ethers.isAddress(factoryAddress) || factoryAddress === "0x00000000fC1237824fb747aBDE0CD183d8C90270")) {
+      factoryAddress = undefined
+    }
+
+    // Create smart wallet configuration for this chain
+    const walletConfig = {
+      client,
+      chain: thirdwebChain,
+      personalAccount: personalAccount,
+      sponsorGas: process.env.SPONSOR_GAS === "true"
+    }
+
+    if (factoryAddress) {
+      walletConfig.factoryAddress = factoryAddress
+    }
+
+    const wallet = smartWallet(walletConfig)
+
+    // Predict wallet address
+    const predictConfig = {
+      client,
+      chain: thirdwebChain,
+      adminAddress: accountAddress
+    }
+
+    if (factoryAddress) {
+      predictConfig.factoryAddress = factoryAddress
+    }
+
+    const walletAddress = await predictSmartAccountAddress(predictConfig)
+
+    console.log(`[getSmartWalletForChain] Wallet created on ${chainConfig.name}: ${walletAddress}`)
+
+    return {
+      walletAddress,
+      smartWallet: wallet,
+      personalAccount,
+      chain: thirdwebChain,
+      chainConfig
+    }
+  } catch (error) {
+    console.error(`[getSmartWalletForChain] Error creating wallet on chain ${chainId}:`, error)
+    throw error
+  }
+}
+
+/**
+ * Send transaction on a specific chain
+ * @param {string} username - Username
+ * @param {number} telegramUserId - Telegram user ID
+ * @param {number} chainId - Target chain ID
+ * @param {string} contractAddress - Contract address
+ * @param {string} functionName - Function name
+ * @param {Array} params - Function parameters
+ * @returns {Promise<string>} Transaction hash
+ */
+export const sendTransactionOnChain = async (
+  username,
+  telegramUserId,
+  chainId,
+  contractAddress,
+  functionName,
+  params = []
+) => {
+  try {
+    // Get smart wallet for the chain
+    const { smartWallet: walletInstance, walletAddress } = await getSmartWalletForChain(
+      username,
+      telegramUserId,
+      chainId
+    )
+
+    // Use the same sendTransactionFromSmartWallet logic but with chain-specific wallet
+    return await sendTransactionFromSmartWallet(
+      walletInstance,
+      contractAddress,
+      functionName,
+      params,
+      null, // personalAccount not needed here
+      walletAddress
+    )
+  } catch (error) {
+    console.error(`[sendTransactionOnChain] Error sending transaction on chain ${chainId}:`, error)
+    throw error
+  }
+}
 
 /**
  * Send a transaction from smart wallet using Thirdweb
@@ -867,7 +992,7 @@ export const registerUsernameInRegistry = async (username, walletAddress, feePay
     const provider = new ethers.JsonRpcProvider(BASE_RPC);
     // Use the centralized contract service for consistency
     const { getUsernameRegistry } = await import('./contracts.js');
-    const registry = getUsernameRegistry();
+    const registry = await getUsernameRegistry();
 
     // Check if already registered
     // ✅ FIX: Use usernameToAddress mapping directly instead of getAddress()

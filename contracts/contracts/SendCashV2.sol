@@ -4,8 +4,8 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 import "./UsernameRegistry.sol";
 
 /**
@@ -16,25 +16,33 @@ import "./UsernameRegistry.sol";
  *      - Configurable fee recipient
  *      - Pausable circuit breaker
  *      - Ability to send by username or raw address
+ *      - Native ETH support alongside ERC20 tokens
  *
  * Notes:
  * - Gas sponsorship / account abstraction is handled off‑chain (Thirdweb SDK).
  * - This contract focuses purely on token transfers and events.
+ * - Native ETH is represented by address(0) in token parameters.
  */
 contract SendCashV2 is Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     UsernameRegistry public immutable usernameRegistry;
 
-    // Supported ERC20 stablecoins
+    // Native ETH address (address(0))
+    address public constant NATIVE_ETH = address(0);
+
+    // Supported ERC20 stablecoins and native ETH
     mapping(address => bool) public supportedTokens;
     address[] public supportedTokenList;
+
+    // Native ETH support flag
+    bool public nativeEthEnabled;
 
     // Fee configuration
     // All fees are expressed in basis points (bps): 1% = 100 bps, 0.5% = 50 bps
     uint256 public feeBps; // global fee, default 50 (0.5%)
-    uint256 public constant MAX_FEE_BPS = 200; // hard cap = 2%
-    uint256 public constant BASIS_POINTS = 10_000;
+    uint256 public immutable MAX_FEE_BPS = 200; // hard cap = 2%
+    uint256 public immutable BASIS_POINTS = 10_000;
 
     // Optional per‑token fee overrides: if 0, fall back to global feeBps
     mapping(address => uint256) public tokenFeeBps;
@@ -57,13 +65,21 @@ contract SendCashV2 is Ownable, ReentrancyGuard, Pausable {
     event TokenRemoved(address indexed token);
 
     event FeeUpdated(uint256 oldFeeBps, uint256 newFeeBps);
-    event TokenFeeUpdated(address indexed token, uint256 oldFeeBps, uint256 newFeeBps);
-    event FeeRecipientUpdated(address indexed oldRecipient, address indexed newRecipient);
+    event TokenFeeUpdated(
+        address indexed token,
+        uint256 oldFeeBps,
+        uint256 newFeeBps
+    );
+    event FeeRecipientUpdated(
+        address indexed oldRecipient,
+        address indexed newRecipient
+    );
 
     constructor(
         address _usernameRegistry,
         address _feeRecipient,
-        uint256 _initialFeeBps
+        uint256 _initialFeeBps,
+        bool _enableNativeEth
     ) Ownable(msg.sender) {
         require(_usernameRegistry != address(0), "Invalid registry");
         require(_feeRecipient != address(0), "Invalid fee recipient");
@@ -72,6 +88,12 @@ contract SendCashV2 is Ownable, ReentrancyGuard, Pausable {
         usernameRegistry = UsernameRegistry(_usernameRegistry);
         feeRecipient = _feeRecipient;
         feeBps = _initialFeeBps; // e.g. 50 = 0.5%
+        nativeEthEnabled = _enableNativeEth;
+
+        // If native ETH is enabled, mark it as supported
+        if (_enableNativeEth) {
+            supportedTokens[NATIVE_ETH] = true;
+        }
     }
 
     // ========= Owner Controls =========
@@ -96,9 +118,18 @@ contract SendCashV2 is Ownable, ReentrancyGuard, Pausable {
 
     /**
      * @dev Set per‑token fee override (in basis points). 0 = use global fee.
+     *      Can also set fee for native ETH using address(0).
      */
-    function setTokenFeeBps(address token, uint256 newFeeBps) external onlyOwner {
-        require(supportedTokens[token], "Token not supported");
+    function setTokenFeeBps(
+        address token,
+        uint256 newFeeBps
+    ) external onlyOwner {
+        // Allow setting fee for native ETH if enabled
+        if (token == NATIVE_ETH) {
+            require(nativeEthEnabled, "Native ETH not enabled");
+        } else {
+            require(supportedTokens[token], "Token not supported");
+        }
         require(newFeeBps <= MAX_FEE_BPS, "Fee too high");
         uint256 old = tokenFeeBps[token];
         tokenFeeBps[token] = newFeeBps;
@@ -113,6 +144,19 @@ contract SendCashV2 is Ownable, ReentrancyGuard, Pausable {
         address old = feeRecipient;
         feeRecipient = newRecipient;
         emit FeeRecipientUpdated(old, newRecipient);
+    }
+
+    /**
+     * @dev Enable or disable native ETH support.
+     */
+    function setNativeEthEnabled(bool enabled) external onlyOwner {
+        nativeEthEnabled = enabled;
+        supportedTokens[NATIVE_ETH] = enabled;
+        if (enabled) {
+            emit TokenAdded(NATIVE_ETH);
+        } else {
+            emit TokenRemoved(NATIVE_ETH);
+        }
     }
 
     /**
@@ -146,6 +190,7 @@ contract SendCashV2 is Ownable, ReentrancyGuard, Pausable {
     }
 
     function getEffectiveFeeBps(address token) public view returns (uint256) {
+        // Native ETH uses global fee or its override
         uint256 overrideBps = tokenFeeBps[token];
         if (overrideBps > 0) {
             return overrideBps;
@@ -153,9 +198,19 @@ contract SendCashV2 is Ownable, ReentrancyGuard, Pausable {
         return feeBps;
     }
 
-    function calculateFee(address token, uint256 amount) public view returns (uint256) {
+    function calculateFee(
+        address token,
+        uint256 amount
+    ) public view returns (uint256) {
         uint256 bps = getEffectiveFeeBps(token);
         return (amount * bps) / BASIS_POINTS;
+    }
+
+    /**
+     * @dev Calculate fee for native ETH payment.
+     */
+    function calculateEthFee(uint256 amount) public view returns (uint256) {
+        return calculateFee(NATIVE_ETH, amount);
     }
 
     // ========= Core Payment Logic =========
@@ -200,6 +255,39 @@ contract SendCashV2 is Ownable, ReentrancyGuard, Pausable {
     }
 
     /**
+     * @dev Send native ETH payment to a username.
+     * @param toUsername The recipient's username (resolved via UsernameRegistry)
+     */
+    function sendEthPayment(
+        string memory toUsername
+    ) external payable nonReentrant whenNotPaused {
+        require(nativeEthEnabled, "Native ETH not enabled");
+        require(msg.value > 0, "Amount must be greater than 0");
+
+        address to = usernameRegistry.getAddress(toUsername);
+        require(to != address(0), "Username not found");
+        require(to != msg.sender, "Cannot send to yourself");
+
+        _executeEthPayment(msg.sender, toUsername, to, msg.value);
+    }
+
+    /**
+     * @dev Send native ETH payment directly to a raw address.
+     *      If the address has a username, it will be included in the event.
+     */
+    function sendEthPaymentToAddress(
+        address to
+    ) external payable nonReentrant whenNotPaused {
+        require(nativeEthEnabled, "Native ETH not enabled");
+        require(msg.value > 0, "Amount must be greater than 0");
+        require(to != address(0), "Invalid recipient");
+        require(to != msg.sender, "Cannot send to yourself");
+
+        string memory toUsername = usernameRegistry.getUsername(to);
+        _executeEthPayment(msg.sender, toUsername, to, msg.value);
+    }
+
+    /**
      * @dev Internal payment implementation shared by both entrypoints.
      */
     function _executePayment(
@@ -238,8 +326,57 @@ contract SendCashV2 is Ownable, ReentrancyGuard, Pausable {
             toUsernameCopy
         );
     }
+
+    /**
+     * @dev Internal ETH payment implementation.
+     */
+    function _executeEthPayment(
+        address from,
+        string memory toUsername,
+        address to,
+        uint256 amount
+    ) internal {
+        uint256 bps = getEffectiveFeeBps(NATIVE_ETH);
+        uint256 fee = (amount * bps) / BASIS_POINTS;
+        uint256 amountAfterFee = amount - fee;
+
+        // Get usernames for event (may be empty strings)
+        string memory fromUsername = usernameRegistry.getUsername(from);
+        string memory toUsernameCopy = toUsername;
+
+        // ETH is already in the contract via msg.value
+        // Send amount minus fee to recipient
+        (bool success, ) = payable(to).call{value: amountAfterFee}("");
+        require(success, "ETH transfer failed");
+
+        // Send fee to feeRecipient (if > 0)
+        if (fee > 0) {
+            (success, ) = payable(feeRecipient).call{value: fee}("");
+            require(success, "ETH fee transfer failed");
+        }
+
+        emit PaymentSent(
+            from,
+            to,
+            NATIVE_ETH,
+            amount,
+            fee,
+            fromUsername,
+            toUsernameCopy
+        );
+    }
+
+    /**
+     * @dev Receive function to allow contract to receive ETH.
+     */
+    receive() external payable {
+        // Allow contract to receive ETH for native payments
+    }
+
+    /**
+     * @dev Fallback function.
+     */
+    fallback() external payable {
+        revert("Function not found");
+    }
 }
-
-
-
-

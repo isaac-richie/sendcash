@@ -18,6 +18,12 @@ export const TOKENS = {
     symbol: 'USDT',
     decimals: 6,
     name: 'Tether USD'
+  },
+  DAI: {
+    address: process.env.VITE_DAI_ADDRESS || '',
+    symbol: 'DAI',
+    decimals: 18,
+    name: 'Dai Stablecoin'
   }
 }
 

@@ -145,12 +145,30 @@ export const senderBotHandlers = (bot) => {
       // Handle both string and object responses
       const responseMessage = typeof aiResponse === 'object' ? aiResponse.message : aiResponse
       const hasCloseButton = typeof aiResponse === 'object' ? aiResponse.hasCloseButton : false
+      const skipBotMessage = typeof aiResponse === 'object' ? aiResponse.skipBotMessage : false
       
       console.log(`[Sender] AI response generated:`, responseMessage ? `${responseMessage.substring(0, 100)}...` : 'null')
+      console.log(`[Sender] Response flags - hasCloseButton: ${hasCloseButton}, skipBotMessage: ${skipBotMessage}`)
+      
+      // Check for registration success message to prevent duplicates
+      const isRegistrationMessage = responseMessage && (
+        responseMessage.includes('Welcome to SendCash') ||
+        responseMessage.includes('wallet has been created')
+      )
+      
+      if (isRegistrationMessage) {
+        console.log(`[Sender] Detected registration success message - ensuring single send`)
+      }
       
       // Check if response indicates needsConfirmation
       if (responseMessage && responseMessage.includes('Reply "yes" or "confirm"')) {
         console.log(`[Sender] ✅ Payment confirmation prompt sent to user`)
+      }
+
+      // Skip sending if flag is set (message already sent by action handler)
+      if (skipBotMessage) {
+        console.log(`[Sender] Skipping message send - already sent by action handler`)
+        return
       }
 
       // Send response
